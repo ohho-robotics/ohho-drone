@@ -1,0 +1,13 @@
+repositories:
+  ohho-ros2-core:
+    type: git
+    url: https://github.com/ohho-robotics/omnibot-ros2.git
+    version: main
+  ohho-ai-nodes:
+    type: git
+    url: https://github.com/ohho-robotics/omnibot-ai-ros2.git
+    version: main
+  ohho-drone-description:
+    type: git
+    url: https://github.com/ohho-robotics/ohho-drone-hardware.git
+    version: main
