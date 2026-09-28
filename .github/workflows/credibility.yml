@@ -1,0 +1,13 @@
+name: credibility
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No failing commands or live capability claims
+        run: bash scripts/check-credibility.sh
