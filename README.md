@@ -1,21 +1,27 @@
-# OhhO Drone 🚁
+# OhhO Drone
 
-The aerial reference architecture for OhhO OS. Integrates MAVLink and PX4 with the OhhO cloud for autonomous 3D spatial mapping and fleet swarm control.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-This repository is part of the **[OhhO Robotics Platform](https://github.com/ohho-robotics)**. It acts as the meta-workspace for onboarding this specific form factor into the OhhO ecosystem.
+**Concept — not started.** The working robot is [OmniBot](https://github.com/ohho-robotics/OmniBot).
 
-## 🚀 Quick Start (Simulation)
-You can test the AI models and control stack for this robot in the OhhO Digital Twin without physical hardware.
+This repository is a placeholder for a drone form factor in the [OhhO Robotics](https://github.com/ohho-robotics) org. It does not contain a robot description, flight controller, simulator, or model.
+
+## Clone
 
 ```bash
-git clone https://github.com/ohho-robotics/OhhO-Drone.git
-cd OhhO-Drone
-vcs import src < ohho.repos
-docker compose up -d
+git clone https://github.com/ohho-robotics/ohho-drone.git
 ```
 
-## 🧩 OhhO Integration
-This hardware profile natively supports:
-- **OhhO Fleet**: Live telemetry and multi-agent coordination.
-- **OhhO Connect**: ROSBridge / WebRTC low-latency streaming.
-- **OhhO Mind**: VLA-based spatial intelligence.
+There is no install step. Nothing in this tree builds or launches a robot.
+
+## License
+
+[Apache License 2.0](LICENSE).
+
+## Roadmap
+
+Not in this repository:
+
+- A checked-in airframe description and a simulator launch that runs from public packages
+- A flight-controller hello-world
+- Hardware bring-up for a specific airframe
