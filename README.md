@@ -25,3 +25,7 @@ Not in this repository:
 - A checked-in airframe description and a simulator launch that runs from public packages
 - A flight-controller hello-world
 - Hardware bring-up for a specific airframe
+
+## Documentation
+
+For experimental stretch work (software simulation only, not flight-ready), see [docs/README.md](docs/README.md) and [AGENTS.md](AGENTS.md).
