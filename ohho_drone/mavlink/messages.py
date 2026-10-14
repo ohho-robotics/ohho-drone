@@ -15,6 +15,33 @@ MAV_CMD_NAV_TAKEOFF = 22
 MAV_CMD_DO_SET_MODE = 176
 MAV_CMD_COMPONENT_ARM_DISARM = 400
 
+# PX4 treats param2=21196 on MAV_CMD_COMPONENT_ARM_DISARM as force-disarm.
+# This stack must never transmit that value.
+MAV_FORCE_DISARM_MAGIC = 21196
+
+# MAV_LANDED_STATE values carried by EXTENDED_SYS_STATE.landed_state
+MAV_LANDED_STATE_UNDEFINED = 0
+MAV_LANDED_STATE_ON_GROUND = 1
+MAV_LANDED_STATE_IN_AIR = 2
+MAV_LANDED_STATE_TAKEOFF = 3
+MAV_LANDED_STATE_LANDING = 4
+
+# PX4 custom_mode packing: (sub_mode << 24) | (main_mode << 16)
+PX4_CUSTOM_MAIN_MODE_AUTO = 4
+PX4_CUSTOM_SUB_MODE_AUTO_LOITER = 3  # HOLD
+PX4_CUSTOM_SUB_MODE_AUTO_LAND = 6
+
+
+def px4_custom_mode(main_mode: int, sub_mode: int) -> int:
+    """Pack a PX4 main mode and sub mode into custom_mode."""
+    return ((sub_mode & 0xFF) << 24) | ((main_mode & 0xFF) << 16)
+
+
+PX4_MODE_AUTO_LOITER = px4_custom_mode(
+    PX4_CUSTOM_MAIN_MODE_AUTO, PX4_CUSTOM_SUB_MODE_AUTO_LOITER
+)
+PX4_MODE_AUTO_LAND = px4_custom_mode(PX4_CUSTOM_MAIN_MODE_AUTO, PX4_CUSTOM_SUB_MODE_AUTO_LAND)
+
 # Command Ack Results
 MAV_RESULT_ACCEPTED = 0
 MAV_RESULT_TEMPORARILY_REJECTED = 1
@@ -316,6 +343,25 @@ class CommandAckMessage:
 
 
 @dataclass
+class ExtendedSysStateMessage:
+    """EXTENDED_SYS_STATE (msg ID 245). Reports landed state."""
+
+    msg_id: ClassVar[int] = 245
+    crc_extra: ClassVar[int] = 130
+
+    vtol_state: int = 0  # MAV_VTOL_STATE_UNDEFINED
+    landed_state: int = MAV_LANDED_STATE_UNDEFINED
+
+    def pack(self) -> bytes:
+        return struct.pack("<BB", self.vtol_state & 0xFF, self.landed_state & 0xFF)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> ExtendedSysStateMessage:
+        vtol_state, landed_state = struct.unpack("<BB", data[:2])
+        return cls(vtol_state=vtol_state, landed_state=landed_state)
+
+
+@dataclass
 class SetPositionTargetLocalNedMessage:
     """SET_POSITION_TARGET_LOCAL_NED (msg ID 84).
 
@@ -382,6 +428,7 @@ CRC_EXTRA_MAP: dict[int, int] = {
     CommandLongMessage.msg_id: CommandLongMessage.crc_extra,
     CommandAckMessage.msg_id: CommandAckMessage.crc_extra,
     SetPositionTargetLocalNedMessage.msg_id: SetPositionTargetLocalNedMessage.crc_extra,
+    ExtendedSysStateMessage.msg_id: ExtendedSysStateMessage.crc_extra,
 }
 
 __all__ = [
@@ -389,6 +436,7 @@ __all__ = [
     "AttitudeMessage",
     "CommandAckMessage",
     "CommandLongMessage",
+    "ExtendedSysStateMessage",
     "GlobalPositionIntMessage",
     "HeartbeatMessage",
     "LocalPositionNedMessage",
@@ -398,8 +446,14 @@ __all__ = [
     "MAV_CMD_DO_SET_MODE",
     "MAV_CMD_NAV_LAND",
     "MAV_CMD_NAV_TAKEOFF",
+    "MAV_FORCE_DISARM_MAGIC",
     "MAV_FRAME_BODY_NED",
     "MAV_FRAME_LOCAL_NED",
+    "MAV_LANDED_STATE_IN_AIR",
+    "MAV_LANDED_STATE_LANDING",
+    "MAV_LANDED_STATE_ON_GROUND",
+    "MAV_LANDED_STATE_TAKEOFF",
+    "MAV_LANDED_STATE_UNDEFINED",
     "MAV_MODE_FLAG_CUSTOM_MODE_ENABLED",
     "MAV_MODE_FLAG_SAFETY_ARMED",
     "MAV_RESULT_ACCEPTED",
@@ -409,6 +463,12 @@ __all__ = [
     "MAV_RESULT_UNSUPPORTED",
     "MAV_TYPE_GENERIC",
     "MAV_TYPE_QUADROTOR",
+    "PX4_CUSTOM_MAIN_MODE_AUTO",
+    "PX4_CUSTOM_SUB_MODE_AUTO_LAND",
+    "PX4_CUSTOM_SUB_MODE_AUTO_LOITER",
+    "PX4_MODE_AUTO_LAND",
+    "PX4_MODE_AUTO_LOITER",
     "SetPositionTargetLocalNedMessage",
     "SysStatusMessage",
+    "px4_custom_mode",
 ]

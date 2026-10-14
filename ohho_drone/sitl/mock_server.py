@@ -20,13 +20,23 @@ from ..mavlink.messages import (
     MAV_CMD_DO_SET_MODE,
     MAV_CMD_NAV_LAND,
     MAV_CMD_NAV_TAKEOFF,
+    MAV_FORCE_DISARM_MAGIC,
+    MAV_LANDED_STATE_IN_AIR,
+    MAV_LANDED_STATE_LANDING,
+    MAV_LANDED_STATE_ON_GROUND,
+    MAV_LANDED_STATE_TAKEOFF,
     MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
     MAV_MODE_FLAG_SAFETY_ARMED,
     MAV_RESULT_ACCEPTED,
+    MAV_RESULT_DENIED,
     MAV_TYPE_QUADROTOR,
+    PX4_CUSTOM_MAIN_MODE_AUTO,
+    PX4_CUSTOM_SUB_MODE_AUTO_LAND,
+    PX4_CUSTOM_SUB_MODE_AUTO_LOITER,
     AttitudeMessage,
     CommandAckMessage,
     CommandLongMessage,
+    ExtendedSysStateMessage,
     GlobalPositionIntMessage,
     HeartbeatMessage,
     LocalPositionNedMessage,
@@ -48,6 +58,7 @@ class MockPx4SitlServer:
         initial_lat: float = 47.397742,  # Zurich default PX4 home
         initial_lon: float = 8.545594,
         initial_alt_amsl: float = 488.0,
+        report_landed_state: bool = True,
     ) -> None:
         self.host = host
         self.requested_port = port
@@ -57,6 +68,9 @@ class MockPx4SitlServer:
         self.home_lat = initial_lat
         self.home_lon = initial_lon
         self.home_alt = initial_alt_amsl
+        self.report_landed_state = report_landed_state
+        # (command, param1, param2) in arrival order, for safety tests.
+        self._commands: list[tuple[int, float, float]] = []
 
         # Flight dynamics state
         self.armed = False
@@ -109,6 +123,11 @@ class MockPx4SitlServer:
         """Altitude above ground in metres."""
         with self._lock:
             return -self.z
+
+    def received_commands(self) -> list[tuple[int, float, float]]:
+        """Copy of COMMAND_LONG traffic as (command, param1, param2)."""
+        with self._lock:
+            return list(self._commands)
 
     def start(self) -> None:
         """Bind socket and spawn receiver and physics ticker threads."""
@@ -171,18 +190,25 @@ class MockPx4SitlServer:
                 pass
 
             elif isinstance(msg, CommandLongMessage):
+                self._commands.append((msg.command, float(msg.param1), float(msg.param2)))
                 if msg.command == MAV_CMD_COMPONENT_ARM_DISARM:
-                    should_arm = bool(int(msg.param1) == 1)
-                    self.armed = should_arm
-                    if should_arm:
-                        if self.flight_mode == FlightMode.DISARMED:
-                            self.flight_mode = FlightMode.STABILIZED
+                    # Refuse the force-disarm magic even if a caller sends it.
+                    if int(msg.param2) == MAV_FORCE_DISARM_MAGIC:
+                        self._send_command_ack(
+                            MAV_CMD_COMPONENT_ARM_DISARM, MAV_RESULT_DENIED, addr
+                        )
                     else:
-                        self.flight_mode = FlightMode.DISARMED
-                        self.vx = self.vy = self.vz = 0.0
-                    self._send_command_ack(
-                        MAV_CMD_COMPONENT_ARM_DISARM, MAV_RESULT_ACCEPTED, addr
-                    )
+                        should_arm = bool(int(msg.param1) == 1)
+                        self.armed = should_arm
+                        if should_arm:
+                            if self.flight_mode == FlightMode.DISARMED:
+                                self.flight_mode = FlightMode.STABILIZED
+                        else:
+                            self.flight_mode = FlightMode.DISARMED
+                            self.vx = self.vy = self.vz = 0.0
+                        self._send_command_ack(
+                            MAV_CMD_COMPONENT_ARM_DISARM, MAV_RESULT_ACCEPTED, addr
+                        )
 
                 elif msg.command == MAV_CMD_NAV_TAKEOFF:
                     if self.armed:
@@ -202,18 +228,54 @@ class MockPx4SitlServer:
                     self._send_command_ack(MAV_CMD_NAV_LAND, MAV_RESULT_ACCEPTED, addr)
 
                 elif msg.command == MAV_CMD_DO_SET_MODE:
-                    # Switch custom mode
+                    self._apply_custom_mode(int(msg.param2), int(msg.param3))
                     self._send_command_ack(
                         MAV_CMD_DO_SET_MODE, MAV_RESULT_ACCEPTED, addr
                     )
 
             elif isinstance(msg, SetPositionTargetLocalNedMessage):
-                if self.armed:
+                # A landing in progress must not be cancelled by an offboard setpoint.
+                if self.armed and self.flight_mode != FlightMode.LAND:
                     self.flight_mode = FlightMode.OFFBOARD
                     self.target_vx = msg.vx
                     self.target_vy = msg.vy
                     self.target_vz = msg.vz
                     self.target_yaw_rate = msg.yaw_rate
+
+    def _apply_custom_mode(self, custom_mode: int, custom_sub: int) -> None:
+        """Map a DO_SET_MODE custom mode onto the simulated flight mode."""
+        main_mode = (custom_mode >> 16) & 0xFF
+        sub_mode = (custom_mode >> 24) & 0xFF
+        if main_mode == 0 and 0 < custom_mode < 256:
+            main_mode = custom_mode
+            sub_mode = custom_sub
+        if (
+            main_mode == PX4_CUSTOM_MAIN_MODE_AUTO
+            and sub_mode == PX4_CUSTOM_SUB_MODE_AUTO_LOITER
+        ):
+            self.flight_mode = FlightMode.HOLD
+            self.target_vx = self.target_vy = self.target_vz = 0.0
+            self.target_yaw_rate = 0.0
+            self.vx = self.vy = self.vz = 0.0
+        elif (
+            main_mode == PX4_CUSTOM_MAIN_MODE_AUTO
+            and sub_mode == PX4_CUSTOM_SUB_MODE_AUTO_LAND
+        ):
+            self.flight_mode = FlightMode.LAND
+
+    def _current_landed_state(self) -> int:
+        """Landed state from altitude and mode. Caller holds ``_lock``."""
+        altitude = -self.z
+        if (
+            self.flight_mode == FlightMode.TAKEOFF
+            and altitude < (self.target_takeoff_alt - 0.05)
+        ):
+            return MAV_LANDED_STATE_TAKEOFF
+        if self.flight_mode == FlightMode.LAND and altitude > 0.05:
+            return MAV_LANDED_STATE_LANDING
+        if altitude > 0.15:
+            return MAV_LANDED_STATE_IN_AIR
+        return MAV_LANDED_STATE_ON_GROUND
 
     def _send_command_ack(
         self, command: int, result: int, addr: tuple[str, int]
@@ -340,6 +402,13 @@ class MockPx4SitlServer:
                     battery_remaining=self.battery_remaining,
                 )
                 self._send_to(sys_msg, addr)
+
+                if self.report_landed_state:
+                    ext = ExtendedSysStateMessage(
+                        vtol_state=0,
+                        landed_state=self._current_landed_state(),
+                    )
+                    self._send_to(ext, addr)
 
     def _send_to(self, msg: object, addr: tuple[str, int]) -> None:
         if self._sock is not None:

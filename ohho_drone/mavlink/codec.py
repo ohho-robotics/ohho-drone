@@ -12,6 +12,7 @@ from .messages import (
     AttitudeMessage,
     CommandAckMessage,
     CommandLongMessage,
+    ExtendedSysStateMessage,
     GlobalPositionIntMessage,
     HeartbeatMessage,
     LocalPositionNedMessage,
@@ -29,6 +30,7 @@ MESSAGE_PARSERS = {
     CommandLongMessage.msg_id: CommandLongMessage.unpack,
     CommandAckMessage.msg_id: CommandAckMessage.unpack,
     SetPositionTargetLocalNedMessage.msg_id: SetPositionTargetLocalNedMessage.unpack,
+    ExtendedSysStateMessage.msg_id: ExtendedSysStateMessage.unpack,
 }
 
 

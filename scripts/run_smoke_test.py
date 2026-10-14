@@ -20,7 +20,11 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from ohho_drone.adapter import MavlinkDroneTransport  # noqa: E402
-from ohho_drone.schema import ConnectionState, DroneVelocity  # noqa: E402
+from ohho_drone.mavlink.messages import (  # noqa: E402
+    MAV_CMD_COMPONENT_ARM_DISARM,
+    MAV_FORCE_DISARM_MAGIC,
+)
+from ohho_drone.schema import ConnectionState, DroneVelocity, FlightMode  # noqa: E402
 from ohho_drone.sitl.mock_server import MockPx4SitlServer  # noqa: E402
 
 
@@ -84,11 +88,14 @@ def run_smoke_test() -> int:
         assert server.armed, "Server does not report armed state"
         print("    Arm command verified.")
 
-        # 5. Takeoff command
+        # 5. Takeoff command. Climb well clear of the ground so the later
+        #    emergency-stop check cannot be confused with touchdown.
         print("[5] Testing takeoff command...")
         transport.takeoff(altitude_m=2.0)
-        time.sleep(0.3)
-        assert server.altitude > 0.1, f"Expected climb, got altitude {server.altitude}"
+        climb_deadline = time.time() + 3.0
+        while server.altitude < 1.0 and time.time() < climb_deadline:
+            time.sleep(0.05)
+        assert server.altitude > 1.0, f"Expected climb, got altitude {server.altitude}"
         print(f"    Takeoff verified (altitude: {server.altitude:.2f}m).")
 
         # 6. Velocity setpoint
@@ -100,13 +107,24 @@ def run_smoke_test() -> int:
         assert server.x > 0.05, f"Expected forward motion, got x={server.x}"
         print(f"    Velocity control verified (x position: {server.x:.2f}m).")
 
-        # 7. Emergency stop
-        print("[7] Testing emergency stop...")
+        # 7. In-flight emergency stop must land/hold, not disarm.
+        print("[7] Testing in-flight emergency stop...")
         transport.emergency_stop()
         time.sleep(0.2)
-        assert not server.armed, "Emergency stop failed to disarm server"
+        assert server.armed, "In-flight emergency stop must not disarm"
+        assert server.flight_mode in (
+            FlightMode.LAND,
+            FlightMode.HOLD,
+        ), f"Expected LAND or HOLD, got {server.flight_mode}"
+        assert not any(
+            c[0] == MAV_CMD_COMPONENT_ARM_DISARM and int(c[1]) == 0
+            for c in server.received_commands()
+        ), "In-flight emergency stop sent a disarm"
+        assert not any(
+            int(c[2]) == MAV_FORCE_DISARM_MAGIC for c in server.received_commands()
+        ), "Force-disarm magic was sent"
         transport.release_stop()
-        print("    Emergency stop verified (autopilot disarmed).")
+        print("    In-flight emergency stop verified (land/hold, still armed).")
 
         # 8. Clean disconnect
         print("[8] Testing disconnect...")

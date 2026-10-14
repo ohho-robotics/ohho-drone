@@ -147,6 +147,8 @@ class DroneTelemetry:
 
     armed: bool = False
     flight_mode: FlightMode = FlightMode.DISARMED
+    # MAV_LANDED_STATE, or None when EXTENDED_SYS_STATE has not been seen.
+    landed_state: int | None = None
     odom: Odometry | None = None
     pose: DronePose | None = None
     velocity: DroneVelocity = field(default_factory=DroneVelocity)
@@ -171,6 +173,7 @@ class DroneTelemetry:
                     "current_a": self.current_a,
                     "satellites": self.satellites_visible,
                     "gps_fix_type": self.gps_fix_type,
+                    "landed_state": self.landed_state,
                     "experimental": True,
                     "flight_ready": False,
                 }

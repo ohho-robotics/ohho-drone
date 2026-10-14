@@ -7,11 +7,15 @@ DO NOT USE FOR REAL AIRCRAFT FLIGHT OR PHYSICAL HARDWARE CONTROL.
 
 Implements the OhhO OS Transport port for MAVLink-enabled flight controllers
 (such as PX4 running in SITL).
+
+Emergency stop lands or holds. It does not kill motors in the air.
+Connections are refused unless the target host is a local simulation endpoint.
 """
 
 from __future__ import annotations
 
 import abc
+import ipaddress
 import select
 import socket
 import threading
@@ -22,14 +26,24 @@ from .mavlink.codec import MavlinkCodec
 from .mavlink.messages import (
     MAV_AUTOPILOT_PX4,
     MAV_CMD_COMPONENT_ARM_DISARM,
+    MAV_CMD_DO_SET_MODE,
     MAV_CMD_NAV_LAND,
     MAV_CMD_NAV_TAKEOFF,
+    MAV_FORCE_DISARM_MAGIC,
     MAV_FRAME_BODY_NED,
+    MAV_LANDED_STATE_IN_AIR,
+    MAV_LANDED_STATE_LANDING,
+    MAV_LANDED_STATE_ON_GROUND,
+    MAV_LANDED_STATE_TAKEOFF,
+    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
     MAV_RESULT_ACCEPTED,
     MAV_TYPE_QUADROTOR,
+    PX4_CUSTOM_SUB_MODE_AUTO_LOITER,
+    PX4_MODE_AUTO_LOITER,
     AttitudeMessage,
     CommandAckMessage,
     CommandLongMessage,
+    ExtendedSysStateMessage,
     GlobalPositionIntMessage,
     HeartbeatMessage,
     LocalPositionNedMessage,
@@ -51,6 +65,97 @@ from .schema import (
 )
 
 Unsubscribe = Callable[[], None]
+
+# Altitude above ground, in metres, treated as airborne when landed_state
+# has not confirmed ON_GROUND. Used only to avoid disarming; it never
+# authorizes a disarm by itself.
+_AIRBORNE_ALTITUDE_M = 0.25
+
+_LOOPBACK_NAMES = frozenset({"localhost"})
+_DOCKER_LOCAL_NAMES = frozenset(
+    {
+        "host.docker.internal",
+        "gateway.docker.internal",
+        "host.containers.internal",
+    }
+)
+_AIRBORNE_LANDED_STATES = frozenset(
+    {
+        MAV_LANDED_STATE_IN_AIR,
+        MAV_LANDED_STATE_TAKEOFF,
+        MAV_LANDED_STATE_LANDING,
+    }
+)
+
+
+def _wire_host(host: str) -> str:
+    """Host string suitable for sendto, with surrounding brackets removed."""
+    text = str(host).strip()
+    if text.startswith("[") and text.endswith("]"):
+        return text[1:-1]
+    return text
+
+
+def _normalize_host(host: str) -> str:
+    text = _wire_host(host).lower()
+    return text
+
+
+def _parse_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(_normalize_host(host))
+    except ValueError:
+        return None
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for 127.0.0.0/8, ::1, and the name localhost."""
+    text = _normalize_host(host)
+    if text in _LOOPBACK_NAMES:
+        return True
+    ip = _parse_ip(text)
+    if ip is None:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        return bool(mapped.is_loopback)
+    return bool(ip.is_loopback)
+
+
+def _is_docker_local_host(host: str) -> bool:
+    """True for well-known local container DNS names, not routable LAN addresses."""
+    text = _normalize_host(host)
+    if text in _DOCKER_LOCAL_NAMES:
+        return True
+    return text.endswith(".docker.internal") or text.endswith(".containers.internal")
+
+
+def simulation_target_allowed(host: str, *, sitl: bool = False) -> bool:
+    """Return whether connect() may open a socket to host.
+
+    Loopback is always allowed. Docker-local names are allowed only when
+    the explicit SITL flag is set. Every other host is refused.
+    """
+    if _is_loopback_host(host):
+        return True
+    return bool(sitl and _is_docker_local_host(host))
+
+
+def simulation_refusal_reason(host: str, *, sitl: bool = False) -> str | None:
+    """Clear error string when host is outside the simulation allow-list."""
+    if simulation_target_allowed(host, sitl=sitl):
+        return None
+    if sitl:
+        return (
+            f"Refusing connection to {host!r}: SITL mode is simulation-only and "
+            "still requires a loopback host (127.0.0.0/8, ::1, localhost) or a "
+            "docker-local host such as host.docker.internal. Other hosts are refused."
+        )
+    return (
+        f"Refusing connection to {host!r}: this transport is simulation-only and "
+        "only accepts loopback hosts (127.0.0.0/8, ::1, localhost). "
+        "Pass sitl=True to also allow docker-local hosts. Other hosts are refused."
+    )
 
 # ── Optional OhhO Transport base import ──────────────────────────────────────
 try:
@@ -135,8 +240,19 @@ except ImportError:
 class MavlinkDroneTransport(BaseTransport):
     """MAVLink adapter for drone flight controllers in OhhO OS.
 
-    Supports connecting to PX4 SITL over UDP, reading odometry and battery telemetry,
-    sending 3D velocities, and safe arming/takeoff/landing lifecycles.
+    Simulation only. Supports PX4 SITL over UDP, odometry and battery telemetry,
+    3D velocity setpoints, and arm / takeoff / land.
+
+    ``connect()`` fails closed unless ``host`` is loopback (127.0.0.0/8, ::1,
+    or localhost). With ``sitl=True``, docker-local names such as
+    ``host.docker.internal`` are also allowed. Every other host is refused
+    before a socket is opened.
+
+    ``emergency_stop()`` does not kill motors in flight. An airborne vehicle
+    is commanded to land (``MAV_CMD_NAV_LAND``). If landed state is unknown,
+    the vehicle is commanded to hold (``MAV_CMD_DO_SET_MODE`` to AUTO.LOITER)
+    and then to land. Motors are disarmed only when ``landed_state`` confirms
+    ``ON_GROUND``. The force-disarm magic value 21196 is never sent.
     """
 
     protocol: str = "mavlink"
@@ -149,6 +265,7 @@ class MavlinkDroneTransport(BaseTransport):
         compid: int = 191,  # MAV_COMP_ID_ONBOARD_COMPUTER
         target_sysid: int = 1,
         target_compid: int = 1,
+        sitl: bool = False,
     ) -> None:
         super().__init__()
         self.host = host
@@ -157,6 +274,8 @@ class MavlinkDroneTransport(BaseTransport):
         self.compid = compid
         self.target_sysid = target_sysid
         self.target_compid = target_compid
+        # Explicit SITL flag. Does not allow routable hosts; see connect().
+        self._sitl = sitl
 
         self._state = ConnectionState.IDLE
         self._connected_since: float | None = None
@@ -177,22 +296,42 @@ class MavlinkDroneTransport(BaseTransport):
         self._last_msg_time = 0.0
         self._last_heartbeat_recv = 0.0
         self._heartbeat_event = threading.Event()
+        # None until EXTENDED_SYS_STATE arrives. Never inferred as ON_GROUND.
+        self._landed_state: int | None = None
 
         # Command acknowledgment tracking
         self._pending_acks: dict[int, tuple[threading.Event, int]] = {}
 
     # ── Transport Interface ──────────────────────────────────────────────────
 
+    @property
+    def landed_state(self) -> int | None:
+        """Latest MAV_LANDED_STATE, or None if the vehicle has not reported one."""
+        with self._lock:
+            return self._landed_state
+
     def connect(self, timeout_s: float = 3.0) -> TransportStatus:
-        """Open UDP socket and wait for initial heartbeat from vehicle."""
+        """Open a UDP socket to a simulation host and wait for a heartbeat.
+
+        Fails closed, with ``TransportStatus.state`` ERROR and a clear
+        ``error``, unless the host is loopback. With ``sitl=True``, a
+        docker-local host is also accepted. No socket is opened on refusal.
+        """
         with self._lock:
             if self._state == ConnectionState.CONNECTED:
+                return self.status()
+
+            refusal = simulation_refusal_reason(self.host, sitl=self._sitl)
+            if refusal is not None:
+                self._error_msg = refusal
+                self._sock = None
+                self._set_state(ConnectionState.ERROR)
                 return self.status()
 
             self._set_state(ConnectionState.CONNECTING)
 
             try:
-                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sock = socket.socket(self._socket_family(), socket.SOCK_DGRAM)
                 self._sock.setblocking(False)
             except Exception as e:
                 self._error_msg = f"Socket creation failed: {e}"
@@ -312,32 +451,29 @@ class MavlinkDroneTransport(BaseTransport):
         pass
 
     def emergency_stop(self) -> None:
-        """Immediately disarm and zero velocity setpoints."""
+        """Land or hold. Disarm only when the vehicle is confirmed on the ground.
+
+        This is not a motor kill. In-air vehicles (EXTENDED_SYS_STATE
+        landed_state of IN_AIR, TAKEOFF, or LANDING, or altitude that shows
+        the vehicle is airborne) receive MAV_CMD_NAV_LAND. If landed state
+        is unknown, the vehicle is commanded to HOLD / AUTO.LOITER via
+        MAV_CMD_DO_SET_MODE and then to land. MAV_CMD_COMPONENT_ARM_DISARM
+        with param1=0 is sent only when landed_state confirms ON_GROUND.
+        The force-disarm magic value 21196 is never sent.
+
+        Further velocity setpoints are blocked until release_stop().
+        """
         with self._lock:
             self._e_stop = True
+            action = self._estop_action_locked()
 
-        # Send immediate disarm command
-        disarm_cmd = CommandLongMessage(
-            command=MAV_CMD_COMPONENT_ARM_DISARM,
-            param1=0.0,  # 0 = disarm
-            target_system=self.target_sysid,
-            target_component=self.target_compid,
-        )
-        self._send_message(disarm_cmd)
-
-        # Zero setpoint
-        zero_vel = SetPositionTargetLocalNedMessage(
-            time_boot_ms=int(time.time() * 1000) & 0xFFFFFFFF,
-            vx=0.0,
-            vy=0.0,
-            vz=0.0,
-            yaw_rate=0.0,
-            type_mask=0x05C7,
-            target_system=self.target_sysid,
-            target_component=self.target_compid,
-            coordinate_frame=MAV_FRAME_BODY_NED,
-        )
-        self._send_message(zero_vel)
+        if action == "disarm":
+            self._send_message(self._ground_disarm_command())
+        elif action == "land":
+            self._send_message(self._land_command())
+        else:
+            self._send_message(self._hold_command())
+            self._send_message(self._land_command())
 
     def release_stop(self) -> None:
         """Release emergency stop lock."""
@@ -360,17 +496,19 @@ class MavlinkDroneTransport(BaseTransport):
         return self._send_command_and_wait_ack(cmd, timeout_s=timeout_s)
 
     def disarm(self, timeout_s: float = 2.0) -> bool:
-        """Disarm the flight controller motors."""
+        """Disarm motors with a normal disarm (param2=0).
+
+        This is the explicit disarm request, separate from emergency_stop().
+        It never sends the force-disarm magic value 21196. Prefer
+        emergency_stop() in flight: that path lands or holds instead of
+        disarming.
+        """
         if self._state != ConnectionState.CONNECTED:
             return False
 
-        cmd = CommandLongMessage(
-            command=MAV_CMD_COMPONENT_ARM_DISARM,
-            param1=0.0,  # 0 = disarm
-            target_system=self.target_sysid,
-            target_component=self.target_compid,
+        return self._send_command_and_wait_ack(
+            self._ground_disarm_command(), timeout_s=timeout_s
         )
-        return self._send_command_and_wait_ack(cmd, timeout_s=timeout_s)
 
     def takeoff(self, altitude_m: float = 2.5, timeout_s: float = 2.0) -> bool:
         """Send takeoff command with desired climb altitude."""
@@ -404,13 +542,89 @@ class MavlinkDroneTransport(BaseTransport):
             self._state = new_state
             self._emit_status(self.status())
 
+    def _socket_family(self) -> int:
+        ip = _parse_ip(self.host)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is None:
+            return socket.AF_INET6
+        return socket.AF_INET
+
+    def _estop_action_locked(self) -> str:
+        """Choose disarm, land, or hold-then-land. Caller holds ``_lock``."""
+        if self._confirmed_on_ground_locked():
+            return "disarm"
+        if self._is_airborne_locked():
+            return "land"
+        return "hold_then_land"
+
+    def _altitude_agl_m_locked(self) -> float | None:
+        """Highest reported height above ground, or None if no position yet."""
+        samples: list[float] = []
+        if self._telemetry.global_pos is not None:
+            samples.append(self._telemetry.global_pos.relative_alt)
+        if self._telemetry.pose is not None:
+            # LOCAL_POSITION_NED z is Down; negative z is above the origin.
+            samples.append(-self._telemetry.pose.z)
+        if not samples:
+            return None
+        return max(samples)
+
+    def _is_airborne_locked(self) -> bool:
+        if self._landed_state in _AIRBORNE_LANDED_STATES:
+            return True
+        altitude = self._altitude_agl_m_locked()
+        return altitude is not None and altitude > _AIRBORNE_ALTITUDE_M
+
+    def _confirmed_on_ground_locked(self) -> bool:
+        """True only when landed_state is ON_GROUND and altitude agrees."""
+        if self._landed_state != MAV_LANDED_STATE_ON_GROUND:
+            return False
+        altitude = self._altitude_agl_m_locked()
+        if altitude is not None and altitude > _AIRBORNE_ALTITUDE_M:
+            return False
+        return True
+
+    def _target_command(self, command: int, **params: float) -> CommandLongMessage:
+        return CommandLongMessage(
+            command=command,
+            target_system=self.target_sysid,
+            target_component=self.target_compid,
+            **params,
+        )
+
+    def _ground_disarm_command(self) -> CommandLongMessage:
+        """Normal disarm. param2 stays 0 so the force-disarm magic is not sent."""
+        return self._target_command(
+            MAV_CMD_COMPONENT_ARM_DISARM,
+            param1=0.0,
+            param2=0.0,
+        )
+
+    def _land_command(self) -> CommandLongMessage:
+        return self._target_command(MAV_CMD_NAV_LAND)
+
+    def _hold_command(self) -> CommandLongMessage:
+        """MAV_CMD_DO_SET_MODE to PX4 AUTO.LOITER (HOLD)."""
+        return self._target_command(
+            MAV_CMD_DO_SET_MODE,
+            param1=float(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            param2=float(PX4_MODE_AUTO_LOITER),
+            param3=float(PX4_CUSTOM_SUB_MODE_AUTO_LOITER),
+        )
+
     def _send_message(self, msg: object) -> None:
+        if (
+            isinstance(msg, CommandLongMessage)
+            and msg.command == MAV_CMD_COMPONENT_ARM_DISARM
+            and int(msg.param2) == MAV_FORCE_DISARM_MAGIC
+        ):
+            # Hard stop: never put the force-disarm magic on the wire.
+            return
         sock = self._sock
         if sock is None:
             return
         try:
             raw = self._codec.encode(msg)
-            sock.sendto(raw, (self.host, self.port))
+            sock.sendto(raw, (_wire_host(self.host), self.port))
         except Exception:
             pass
 
@@ -482,6 +696,10 @@ class MavlinkDroneTransport(BaseTransport):
 
                 self._heartbeat_event.set()
 
+            elif isinstance(msg, ExtendedSysStateMessage):
+                self._landed_state = int(msg.landed_state)
+                self._telemetry.landed_state = self._landed_state
+
             elif isinstance(msg, CommandAckMessage):
                 if msg.command in self._pending_acks:
                     event, _ = self._pending_acks[msg.command]
@@ -551,4 +769,8 @@ class MavlinkDroneTransport(BaseTransport):
         self._emit_telemetry(self.read())
 
 
-__all__ = ["MavlinkDroneTransport"]
+__all__ = [
+    "MavlinkDroneTransport",
+    "simulation_refusal_reason",
+    "simulation_target_allowed",
+]

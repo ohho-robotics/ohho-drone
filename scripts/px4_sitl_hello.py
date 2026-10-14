@@ -98,6 +98,9 @@ def main() -> int:
         port=target_port,
         sysid=255,
         compid=191,
+        # Explicit SITL flag. The transport still refuses any host that is
+        # not loopback or docker-local.
+        sitl=True,
     )
 
     telemetry_samples = []

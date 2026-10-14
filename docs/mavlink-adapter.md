@@ -56,6 +56,7 @@ The prototype implements a pure-Python codec supporting both MAVLink v1 and v2 w
 | `ATTITUDE` | 30 | `pose.roll`, `pitch`, `yaw` | Vehicle Euler orientation and angular rotation rates. |
 | `LOCAL_POSITION_NED` | 32 | `odom`, `pose.x, y, z`, `velocity` | Local position and linear velocity estimates. |
 | `GLOBAL_POSITION_INT` | 33 | `global_pos` | Fused GNSS coordinates (WGS84 latitude, longitude, AMSL). |
+| `EXTENDED_SYS_STATE` | 245 | `landed_state` | Landed state used by emergency stop (on ground, in air, or unknown). |
 | `COMMAND_ACK` | 77 | internal command handlers | Confirms acceptance or rejection of commands. |
 
 ### Outbound Messages (OhhO to Autopilot)
@@ -63,9 +64,10 @@ The prototype implements a pure-Python codec supporting both MAVLink v1 and v2 w
 | MAVLink Message | Message ID | Source Method | Description |
 |---|---|---|---|
 | `HEARTBEAT` | 0 | background thread | Broadcast at 1 Hz from companion/GCS system ID. |
-| `COMMAND_LONG` (400) | 76 | `arm()`, `disarm()`, `emergency_stop()` | Arms or disarms the motor safety switch. |
+| `COMMAND_LONG` (400) | 76 | `arm()`, `disarm()`, on-ground `emergency_stop()` | Arms, or disarms with `param1 = 0` and `param2 = 0`. Never sends the force-disarm value 21196. Emergency stop uses this only when landed state is `ON_GROUND`. |
 | `COMMAND_LONG` (22) | 76 | `takeoff(altitude_m)` | Commands vehicle takeoff to specified altitude. |
-| `COMMAND_LONG` (21) | 76 | `land()` | Initiates descent and touchdown at current location. |
+| `COMMAND_LONG` (21) | 76 | `land()`, in-air `emergency_stop()` | Initiates descent and touchdown at the current location. |
+| `COMMAND_LONG` (176) | 76 | `emergency_stop()` when landed state is unknown | `MAV_CMD_DO_SET_MODE` to HOLD / AUTO.LOITER, followed by land. |
 | `SET_POSITION_TARGET_LOCAL_NED` | 84 | `send_velocity()`, `send_drone_velocity()` | Streams 3D velocity vectors with position/acceleration ignored. |
 
 ---
@@ -90,13 +92,15 @@ This ensures predictable velocity-based guidance from high-level planners withou
 
 ## 5. Failsafe & Emergency Stop Handling
 
-Safety is critical when interfacing with aerial vehicles:
-1. **Heartbeat Monitoring:** If heartbeats from the autopilot cease for more than 2.0 seconds, `TransportStatus.state` transitions from `CONNECTED` to `ERROR` or `RECONNECTING`.
-2. **Emergency Stop (`emergency_stop()`):**
-   - Immediately sets an internal software lock `_e_stop = True`.
-   - Sends `MAV_CMD_COMPONENT_ARM_DISARM` with `param1 = 0` (immediate motor shutdown).
-   - Transmits zero velocity setpoints `(0, 0, 0, 0)`.
-   - Blocks subsequent velocity commands until `release_stop()` is explicitly called.
+Safety is critical when interfacing with aerial vehicles, including simulated ones:
+
+1. **Simulation-only transport:** `connect()` fails closed unless the host is loopback (`127.0.0.0/8`, `::1`, or `localhost`). An explicit `sitl=True` flag also allows docker-local names such as `host.docker.internal`. Every other host is refused before a socket is opened, with `TransportStatus.state = ERROR` and a clear error string.
+2. **Emergency stop (`emergency_stop()`) lands or holds. It does not kill motors in the air.**
+   - Sets an internal software lock `_e_stop = True`, which blocks later velocity commands until `release_stop()`.
+   - If `EXTENDED_SYS_STATE.landed_state` is `IN_AIR`, `TAKEOFF`, or `LANDING`, or if altitude shows the vehicle is airborne, sends `MAV_CMD_NAV_LAND`.
+   - If landed state is unknown, sends `MAV_CMD_DO_SET_MODE` to HOLD / `AUTO.LOITER`, then `MAV_CMD_NAV_LAND`.
+   - Sends `MAV_CMD_COMPONENT_ARM_DISARM` with `param1 = 0` and `param2 = 0` only when `landed_state` confirms `ON_GROUND` and altitude does not show the vehicle is airborne.
+   - Never sends the force-disarm magic value `21196`.
 
 ---
 
