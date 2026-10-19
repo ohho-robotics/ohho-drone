@@ -90,6 +90,31 @@ install_gazebo() {
   apt_get install -y --no-install-recommends gz-harmonic libgl1-mesa-dri
 }
 
+install_px4_sim_deps() {
+  # px4io/px4-dev:v1.17.0 is Ubuntu 24.04 with Tools/setup/ubuntu.sh --no-sim-tools.
+  # gz-harmonic is installed above. The v1.17.0 sim set also has the packages
+  # the gz plugins configure against: optical_flow requires OpenCV, the
+  # gstreamer plugin needs the GStreamer dev files, and Ubuntu 24.04's
+  # ubuntu.sh also installs cppzmq-dev with Gazebo Harmonic (libzmq3-dev
+  # does not ship zmq.hpp). Eigen, unwind, pkg-config, and protobuf are the
+  # rest of that ubuntu.sh list the bridge and plugins link against.
+  log "installing PX4 v1.17.0 Gazebo plugin packages"
+  . /etc/os-release
+  local packages=(
+    libeigen3-dev
+    libgstreamer-plugins-base1.0-dev
+    libopencv-dev
+    libunwind-dev
+    pkg-config
+    protobuf-compiler
+  )
+  if [ "${VERSION_ID:-}" = "24.04" ]; then
+    packages+=(cppzmq-dev)
+  fi
+  apt_get update -y --quiet
+  apt_get install -y --no-install-recommends "${packages[@]}"
+}
+
 install_ros() {
   if [ -f /opt/ros/jazzy/setup.bash ]; then
     log "ROS 2 Jazzy already installed"
@@ -187,6 +212,7 @@ copy_logs() {
 trap 'copy_logs $?' EXIT
 
 install_gazebo
+install_px4_sim_deps
 install_ros
 install_agent
 build_px4_msgs

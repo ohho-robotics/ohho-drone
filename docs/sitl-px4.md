@@ -27,9 +27,13 @@ records the runtime on its first GitHub Actions run.
 not on Docker Hub on 19 October 2026. `px4io/px4-sitl-gazebo-ros2:latest` is
 `v1.18.0-beta1-660-g61907962c9`. ohho-os refuses a v1.18 message definition,
 so the workflow does not pull `latest`. The dev image above was published with
-the v1.17.0 release and does not already contain Gazebo or the SITL binary.
-`scripts/run_sitl_px4.sh` installs Gazebo Harmonic and builds the `v1.17.0`
-tag inside that image.
+the v1.17.0 release. Its Dockerfile runs `Tools/setup/ubuntu.sh --no-sim-tools`
+on Ubuntu 24.04, so it does not contain Gazebo, OpenCV, or the SITL binary.
+`scripts/run_sitl_px4.sh` installs Gazebo Harmonic, then the v1.17.0
+`ubuntu.sh` packages the gz plugins need (`libopencv-dev` for
+`gz_plugins/optical_flow`, `libgstreamer-plugins-base1.0-dev`, `cppzmq-dev`
+on Ubuntu 24.04, plus Eigen, unwind, pkg-config, and protobuf), and builds
+the `v1.17.0` tag inside that image.
 
 The plan's budget for a prebuilt image is 20 minutes cold and 8 minutes warm.
 The workflow's hard timeout is 40 minutes so the first compile can finish and
@@ -110,9 +114,10 @@ flight.
 
 Confirm the image digest is the index or amd64 digest in the table before
 trusting a retag of `v1.17.0`. `scripts/run_sitl_px4.sh` checks out PX4
-`v1.17.0`, builds `px4_sitl_default`, starts `MicroXRCEAgent udp4 -p 8888`,
-then runs `HEADLESS=1 PX4_SIM_MODEL=gz_x500 PX4_SIM_SPEED_FACTOR=1 make
-px4_sitl gz_x500`. The Ohho process is `scripts/sitl_square.py`.
+`v1.17.0`, installs the simulation packages above, builds `px4_sitl_default`,
+starts `MicroXRCEAgent udp4 -p 8888`, then runs `HEADLESS=1
+PX4_SIM_MODEL=gz_x500 PX4_SIM_SPEED_FACTOR=1 make px4_sitl gz_x500`. The Ohho
+process is `scripts/sitl_square.py`.
 
 Mission rules without a simulator:
 

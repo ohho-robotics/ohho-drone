@@ -363,8 +363,23 @@ class WorkflowFileTest(unittest.TestCase):
             "px4+dds://127.0.0.1:8888",
             "echo $$",
             "px4.pid",
+            "libopencv-dev",
+            "libgstreamer-plugins-base1.0-dev",
+            "cppzmq-dev",
+            "libeigen3-dev",
+            "libunwind-dev",
+            "protobuf-compiler",
+            "install_px4_sim_deps",
         ):
             self.assertIn(required, script, required)
+        self.assertLess(
+            script.index("\ninstall_px4_sim_deps\n"),
+            script.index("\nbuild_px4\n"),
+        )
+        self.assertLess(
+            script.index("libopencv-dev"),
+            script.index('make -C "$PX4_SRC" px4_sitl_default'),
+        )
         self.assertNotIn("PX4_PID=$!", script)
         self.assertNotIn("OHHO_ARM_HARDWARE=1", script)
         self.assertNotIn("--privileged", script)
