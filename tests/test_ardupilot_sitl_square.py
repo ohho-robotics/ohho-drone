@@ -62,6 +62,12 @@ class FakeVehicle:
             readiness=self.readiness,
         )
 
+    def arm_gate(self) -> None:
+        self.calls.append("arm_gate")
+
+    def stream_setpoint(self, x: float, y: float, z: float, yaw: float) -> None:
+        self.calls.append("stream_setpoint")
+
     def arm(self) -> None:
         self.calls.append("arm")
         if self.clock is not None:
@@ -106,6 +112,10 @@ class Recorder:
 
     def telemetry(self):
         return type("Tele", (), {})()
+
+    def arm(self) -> bool:
+        self.calls.append(("arm",))
+        return True
 
     def arm_flight(self) -> None:
         self.calls.append(("arm_flight",))
@@ -162,6 +172,14 @@ class GeometryTests(unittest.TestCase):
             self.assertAlmostEqual(math.dist(earlier[:2], later[:2]), step)
             self.assertEqual(later[2], -2.5)
 
+    def test_square_fits_the_aerial_gate_limits(self) -> None:
+        # ohh-305 aerial profile: takeoff cap 3 m, fence altitude 3 m, fence
+        # radius 10 m, horizontal speed cap 1.5 m/s, setpoint window 300 ms.
+        self.assertLessEqual(square.TAKEOFF_ALT_M, 3.0)
+        self.assertLessEqual(square.SPEED_MPS, 1.5)
+        self.assertLess(math.hypot(square.SIDE_M, square.SIDE_M), 10.0)
+        self.assertLess(1.0 / square.STREAM_HZ, 0.3)
+
 
 class FlightTests(unittest.TestCase):
     def test_square_passes_and_disarms_only_after_land(self) -> None:
@@ -174,8 +192,15 @@ class FlightTests(unittest.TestCase):
         self.assertEqual(report.landed_state, "on_ground")
         self.assertFalse(report.armed)
         self.assertEqual(report.failsafe, [])
-        self.assertLess(vehicle.calls.index("arm"), vehicle.calls.index("takeoff"))
-        self.assertLess(vehicle.calls.index("takeoff"), vehicle.calls.index("goto"))
+        arm_at = vehicle.calls.index("arm")
+        takeoff_at = vehicle.calls.index("takeoff")
+        self.assertLess(vehicle.calls.index("arm_gate"), vehicle.calls.index("stream_setpoint"))
+        self.assertLess(vehicle.calls.index("stream_setpoint"), arm_at)
+        self.assertGreater(
+            vehicle.calls[arm_at + 1 : takeoff_at].count("stream_setpoint"), 1
+        )
+        self.assertLess(arm_at, takeoff_at)
+        self.assertLess(takeoff_at, vehicle.calls.index("goto"))
         self.assertLess(vehicle.calls.index("goto"), vehicle.calls.index("land"))
         self.assertLess(vehicle.calls.index("land"), vehicle.calls.index("disarm"))
         self.assertEqual(vehicle.calls.count("disarm"), 1)
@@ -559,6 +584,10 @@ class _HealthRobot:
     def telemetry(self) -> object:
         return type("Tele", (), {"custom": self.custom})()
 
+    def arm(self) -> bool:
+        self.calls.append(("arm",))
+        return True
+
     def arm_flight(self) -> None:
         self.calls.append(("arm_flight",))
 
@@ -701,6 +730,17 @@ class HealthWatchTests(unittest.TestCase):
         vehicle.close()
         self.assertTrue(direct.destroyed)
 
+    def test_watch_reads_the_system_through_the_wrapped_inner_transport(self) -> None:
+        robot, action = self._robot()
+        inner = robot.transport
+        robot.transport = type("Gate", (), {"_inner": inner})()
+        direct = _Direct(object())
+        watch = self._attach(robot, direct)
+        self.assertIs(direct.system, action._owner)
+        self.assertIn("reading ArduPilot SYS_STATUS", watch.note)
+        watch.close()
+        self.assertTrue(direct.destroyed)
+
     def test_send_failure_is_logged_and_does_not_arm(self) -> None:
         robot, _action = self._robot()
         direct = _Direct(object())
@@ -711,6 +751,131 @@ class HealthWatchTests(unittest.TestCase):
         self.assertIn("message interval request failed", buf.getvalue())
         self.assertFalse(watch.poll().ready())
         watch.close()
+
+
+class _Gate:
+    def __init__(self, error: str | None = None) -> None:
+        self.last_error = error
+        self.latched = False
+        self.latch_reason = None
+        self.profile = type("Profile", (), {"aerial": True})()
+
+
+class _GateRobot:
+    def __init__(self, error: str | None = None, *, arm_ok: bool = True) -> None:
+        self.transport = _Gate(error)
+        self.arm_ok = arm_ok
+        self.refusal = error
+        self.calls: list[tuple[object, ...]] = []
+
+    def telemetry(self) -> object:
+        return type("Tele", (), {})()
+
+    def arm(self) -> bool:
+        self.calls.append(("arm",))
+        if not self.arm_ok:
+            self.transport.last_error = self.refusal
+            return False
+        return True
+
+    def arm_flight(self) -> None:
+        self.calls.append(("arm_flight",))
+
+    def offboard_position(
+        self, x: float, y: float, z: float, yaw: float, frame: object
+    ) -> None:
+        self.calls.append(("offboard_position", x, y, z, yaw, frame))
+
+    def takeoff(self, alt_m: float) -> None:
+        self.calls.append(("takeoff", alt_m))
+
+    def land(self) -> None:
+        self.calls.append(("land",))
+
+    def disarm_flight(self) -> None:
+        self.calls.append(("disarm_flight",))
+
+    def disconnect(self) -> None:
+        self.calls.append(("disconnect",))
+
+
+class GateFlightTests(unittest.TestCase):
+    def test_vehicle_calls_gate_methods_with_a_setpoint_before_arm_flight(self) -> None:
+        robot = _GateRobot()
+        frame = object()
+        vehicle = square.OhhoVehicle(
+            robot, frame, health=square.CopterReadinessWatch()
+        )
+        vehicle.arm_gate()
+        vehicle.stream_setpoint(1.0, 2.0, 0.0, 0.0)
+        vehicle.arm()
+        vehicle.takeoff(2.5)
+        vehicle.goto(4.0, 0.0, -2.5, 0.0)
+        vehicle.land()
+        vehicle.disarm()
+        names = [call[0] for call in robot.calls]
+        self.assertEqual(
+            names,
+            [
+                "arm",
+                "offboard_position",
+                "arm_flight",
+                "takeoff",
+                "offboard_position",
+                "land",
+                "disarm_flight",
+            ],
+        )
+        self.assertLess(names.index("offboard_position"), names.index("arm_flight"))
+        self.assertIs(robot.calls[1][5], frame)
+        self.assertEqual(robot.calls[3], ("takeoff", 2.5))
+
+    def test_gate_refusal_becomes_the_failure_reason(self) -> None:
+        robot = _GateRobot()
+
+        def arm_flight() -> None:
+            robot.calls.append(("arm_flight",))
+            robot.transport.last_error = "no_setpoint_stream"
+
+        robot.arm_flight = arm_flight  # type: ignore[method-assign]
+        vehicle = square.OhhoVehicle(
+            robot, object(), health=square.CopterReadinessWatch()
+        )
+        with self.assertRaises(square.SquareFailed) as caught:
+            vehicle.arm()
+        self.assertIn("no_setpoint_stream", str(caught.exception))
+        self.assertIn("refused by SafetyGate", str(caught.exception))
+        payload = square._failure_payload(caught.exception, 1.25)
+        self.assertFalse(payload["passed"])
+        self.assertIn("no_setpoint_stream", str(payload["message"]))
+
+        flyer = FakeVehicle()
+
+        def refuse_arm() -> None:
+            flyer.calls.append("arm")
+            raise square.SquareFailed(
+                "arm_flight refused by SafetyGate: no_setpoint_stream"
+            )
+
+        flyer.arm = refuse_arm  # type: ignore[method-assign]
+        clock = FakeClock()
+        with self.assertRaises(square.SquareFailed) as flown:
+            square.fly_square(flyer, sleep=clock.sleep, monotonic=clock)
+        self.assertIn("no_setpoint_stream", str(flown.exception))
+        flown_payload = square._failure_payload(flown.exception, clock.t)
+        self.assertIn("no_setpoint_stream", str(flown_payload["message"]))
+        self.assertIn("land", flyer.calls)
+        self.assertNotIn("disarm", flyer.calls)
+
+    def test_gate_arm_refusal_names_last_error(self) -> None:
+        robot = _GateRobot(error="ci", arm_ok=False)
+        vehicle = square.OhhoVehicle(
+            robot, object(), health=square.CopterReadinessWatch()
+        )
+        with self.assertRaises(square.SquareFailed) as caught:
+            vehicle.arm_gate()
+        self.assertIn("SafetyGate.arm() refused the gate", str(caught.exception))
+        self.assertIn("ci", str(caught.exception))
 
 
 class CliTests(unittest.TestCase):
@@ -744,6 +909,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("pre-arm", result.stdout)
         self.assertIn("EKF", result.stdout)
         self.assertIn("GPS fix_type", result.stdout)
+        self.assertIn("SafetyGate", result.stdout)
+        self.assertIn("OHHO_CI_SIM_ARMING=1", result.stdout)
+        self.assertIn("OHHO_CI_SITL=1", result.stdout)
         self.assertNotIn("is_armable", result.stdout)
         self.assertNotIn("OHHO_ARM_HARDWARE=", result.stdout)
 
@@ -766,6 +934,59 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("OHHO_ARM_HARDWARE", result.stderr)
         self.assertNotIn("square-result.json", result.stderr)
+
+    def test_open_sitl_refuses_without_opt_in_under_github_actions(self) -> None:
+        import os
+        from unittest import mock
+
+        env = os_environ_without_arm()
+        env["GITHUB_ACTIONS"] = "true"
+        env.pop("OHHO_CI_SIM_ARMING", None)
+        env.pop("OHHO_CI_SITL", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(square.Refused) as caught:
+                square.open_sitl()
+        message = str(caught.exception)
+        self.assertIn("OHHO_CI_SIM_ARMING", message)
+        self.assertIn("OHHO_CI_SITL", message)
+
+    def test_open_sitl_refuses_a_partial_or_non_exact_opt_in(self) -> None:
+        import os
+        from unittest import mock
+
+        cases = (
+            {"OHHO_CI_SIM_ARMING": "1"},
+            {"OHHO_CI_SITL": "1"},
+            {"OHHO_CI_SIM_ARMING": "true", "OHHO_CI_SITL": "1"},
+            {"OHHO_CI_SIM_ARMING": "1", "OHHO_CI_SITL": "true"},
+        )
+        for extra in cases:
+            env = os_environ_without_arm()
+            env["GITHUB_ACTIONS"] = "true"
+            env.pop("OHHO_CI_SIM_ARMING", None)
+            env.pop("OHHO_CI_SITL", None)
+            env.update(extra)
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(square.Refused):
+                    square.open_sitl()
+
+    def test_open_sitl_refuses_when_hardware_arming_is_present(self) -> None:
+        import os
+        from unittest import mock
+
+        env = os_environ_without_arm()
+        env["OHHO_ARM_HARDWARE"] = ""
+        env["GITHUB_ACTIONS"] = "true"
+        env["OHHO_CI_SIM_ARMING"] = "1"
+        env["OHHO_CI_SITL"] = "1"
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(square.Refused) as caught:
+                square.open_sitl()
+        self.assertIn("OHHO_ARM_HARDWARE", str(caught.exception))
+
+    def test_opt_in_is_not_required_outside_github_actions(self) -> None:
+        square._require_ci_sim_opt_in({})
+        square._require_ci_sim_opt_in({"OHHO_CI_SIM_ARMING": "1"})
 
 
 def os_environ_without_arm() -> dict[str, str]:

@@ -25,7 +25,7 @@ Same criteria as D-07, through the Ohho MAVLink backend:
 
 `scripts/ardupilot_sitl_square.py --fly` is that sequence. With no arguments the script prints the recipe and exits 0. The headless SITL launch is `sim_vehicle.py -v ArduCopter -w --speedup=1 --no-mavproxy --no-rebuild`, with serial0 `udpclient:127.0.0.1:14540` so the vehicle sends to the port Ohho listens on. The runner has no `DISPLAY`, so `run_in_terminal_window.sh` writes `/tmp/ArduCopter.log`.
 
-`SafetyGate` still treats protocol `mavlink` as hardware, and a `CI` environment refuses arm and takeoff there. The transport flag for this URI is a simulation target (`requires_hardware_arming` is false). The script builds `Robot` on `MavlinkDroneTransport` directly and calls `arm_flight`, which is `MAV_CMD_COMPONENT_ARM_DISARM` with param2 0. A follow-up in ohho-os can teach the gate to read `simulation_target`; this repo does not edit that gate.
+The square goes through `Robot.connect` and the aerial `SafetyGate`. Under GitHub Actions the fly step sets `OHHO_CI_SIM_ARMING=1` and `OHHO_CI_SITL=1`, and the workflow leaves `OHHO_ARM_HARDWARE` unset. That opt-in is the ohho-os sim-only arming exception for loopback `mavlink+udp://`. The gate still enforces its allowlist, the 10 m / 3 m cylinder, the 3 m takeoff cap, speed caps, the battery and link takeoff block, a setpoint in the last 300 ms before `arm_flight`, the e-stop latch, and the watchdogs. This repo does not raise those limits. Takeoff is 2.5 m and the 4 m square (about 5.7 m from the origin at the far corner) fits inside them. `arm_flight` is `MAV_CMD_COMPONENT_ARM_DISARM` with param2 0.
 
 ## Modes
 
@@ -40,7 +40,7 @@ External setpoints are [ArduPilot GUIDED](https://ardupilot.org/copter/docs/ac2_
 | Land | LAND. Ohho `land()` is MAVSDK `land` | Land. Same Ohho call |
 | Return | [RTL](https://ardupilot.org/copter/docs/rtl-mode.html). Ohho `rtl()` is MAVSDK `return_to_launch` | Return. Same Ohho call |
 
-Takeoff in the square is MAVSDK `takeoff` (`MAV_CMD_NAV_TAKEOFF`) before the position stream. The stream then walks a carrot along each side at 0.5 m/s, 10 Hz, in `LOCAL_NED`. A position stream before takeoff would hold the vehicle on the ground.
+The aerial gate is armed before the autopilot. A ground-hold offboard stream at 10 Hz runs before and during `arm_flight`, because the gate refuses that arm without a setpoint in the last 300 ms. Takeoff is then MAVSDK `takeoff` (`MAV_CMD_NAV_TAKEOFF`). The carrot stream walks each side at 0.5 m/s, 10 Hz, in `LOCAL_NED` after the climb.
 
 Offboard loss on PX4 waits [`COM_OF_LOSS_T`](https://docs.px4.io/v1.17/en/advanced_config/parameter_reference.html#COM_OF_LOSS_T) (default 1.0 s) and then does [`COM_OBL_RC_ACT`](https://docs.px4.io/v1.17/en/advanced_config/parameter_reference.html#COM_OBL_RC_ACT). Default 0 is Position mode. The value list also contains Terminate (6) and Disarm (7). Those two stay unused. Ohho keeps streaming at 10 Hz for the whole square so the timer does not expire.
 
@@ -57,7 +57,7 @@ Copter 4.7 replaced `ARMING_CHECK` with [`ARMING_SKIPCHK`](https://ardupilot.org
 | [`ARMING_OPTIONS`](https://ardupilot.org/copter/docs/parameters-Copter-stable-V4.7.0.html#arming-options-arming-options) | Display and ICE-motor options. It does not skip the pre-arm checks. |
 | [`ARMING_RUDDER`](https://ardupilot.org/copter/docs/parameters-Copter-stable-V4.7.0.html#arming-rudder-arming-with-rudder-enable-disable) | Stick arming. SITL arming in this job is the MAVLink arm command. |
 
-The Copter procedure is [Arming the motors](https://ardupilot.org/copter/docs/arming_the_motors.html). PX4 pre-arm and arm checks are [Prearm, Arm, Disarm Configuration](https://docs.px4.io/v1.17/en/advanced_config/prearm_arm_disarm) and the [safety page](https://docs.px4.io/v1.17/en/config/safety). Ohho `arm_flight` asks the autopilot to arm. Ohho `arm()` is the safety-gate phrase, and this CI job does not call it.
+The Copter procedure is [Arming the motors](https://ardupilot.org/copter/docs/arming_the_motors.html). PX4 pre-arm and arm checks are [Prearm, Arm, Disarm Configuration](https://docs.px4.io/v1.17/en/advanced_config/prearm_arm_disarm) and the [safety page](https://docs.px4.io/v1.17/en/config/safety). Ohho `arm()` arms the safety gate. This CI job calls it under the sim-only opt-in, then streams a setpoint and calls `arm_flight`. It does not set `OHHO_ARM_HARDWARE` and it does not type the hardware phrase.
 
 ## Fence
 
@@ -78,7 +78,7 @@ Copter fence guide: [Fences](https://ardupilot.org/copter/docs/common-geofencing
 
 PX4 geofence actions are described on the [safety page](https://docs.px4.io/v1.17/en/config/safety). `GF_ACTION` Hold matches the plan's first-flight action. `GF_MAX_HOR_DIST` and `GF_MAX_VER_DIST` stay at 0 until a person sets them for a real flight. This workflow does not disable a fence to make the square pass, and it does not turn a fence on with a radius inside the documented Copter minimum.
 
-Ohho's own cylinder (default sim radius 10 m, max altitude 3 m) lives in the safety gate. The gate is not wrapped on this loopback path. The square is 4 m on a side around the takeoff point and 2.5 m up, inside both the default 300 m Copter cylinder and a 10 m Ohho cylinder.
+Ohho's own cylinder (default sim radius 10 m, max altitude 3 m) is the aerial `SafetyGate` profile on this path. The square is 4 m on a side around the takeoff point and 2.5 m up, inside both the default 300 m Copter cylinder and that 10 m Ohho cylinder, and under the 3 m takeoff cap.
 
 ## RTL
 

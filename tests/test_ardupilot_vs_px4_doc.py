@@ -129,6 +129,10 @@ class DocTests(unittest.TestCase):
             self.text,
         )
         self.assertNotIn("ohho[mavlink]", self.text)
+        self.assertIn("Robot.connect", self.text)
+        self.assertIn("aerial `SafetyGate`", self.text)
+        self.assertIn("OHHO_CI_SIM_ARMING=1", self.text)
+        self.assertIn("OHHO_CI_SITL=1", self.text)
 
 
 if __name__ == "__main__":

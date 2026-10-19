@@ -89,6 +89,29 @@ class WorkflowTests(unittest.TestCase):
         for skipped in ("wxpython", "matplotlib", "opencv-python", "pygame"):
             self.assertNotIn(skipped, step)
 
+    def test_sim_arming_opt_in_is_only_on_the_fly_step(self) -> None:
+        fly = self.text.index("name: Fly the square")
+        stop = self.text.index("name: Stop SITL", fly)
+        step = self.text[fly:stop]
+        self.assertIn("env:", step)
+        self.assertIn('OHHO_CI_SIM_ARMING: "1"', step)
+        self.assertIn('OHHO_CI_SITL: "1"', step)
+        self.assertNotIn("OHHO_CI_SIM_ARMING", self.text[:fly])
+        self.assertNotIn("OHHO_CI_SITL", self.text[:fly])
+        self.assertNotIn("OHHO_CI_SIM_ARMING", self.text[stop:])
+        self.assertNotIn("OHHO_CI_SITL", self.text[stop:])
+        self.assertIn("Leave hardware arming unset", self.text)
+        self.assertIn("OHHO_ARM_HARDWARE+x", self.text)
+        self.assertNotIn("OHHO_ARM_HARDWARE=", self.text)
+
+    def test_install_step_prints_the_resolved_ohho_os_commit(self) -> None:
+        install = self.text.index("Install OhhO OS")
+        clone = self.text.index("Clone ArduPilot", install)
+        step = self.text[install:clone]
+        self.assertIn("python -m pip show ohho-os", step)
+        self.assertIn("direct_url.json", step)
+        self.assertIn("ohh-305-mavlink-backend", step)
+
 
 if __name__ == "__main__":
     unittest.main()

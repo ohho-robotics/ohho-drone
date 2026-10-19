@@ -2,13 +2,16 @@
 
 OHH-306. The workflow starts ``sim_vehicle.py -v ArduCopter`` headless at the
 pinned Copter-4.7.2 tag, then this script waits until ArduPilot's own pre-arm
-bit, EKF flags, and a 3D GPS fix say the copter is armable, arms, climbs to
+bit, EKF flags, and a 3D GPS fix say the copter is armable. It arms the aerial
+``SafetyGate``, streams an offboard setpoint, arms the autopilot, climbs to
 2.5 m, flies a 4 m square, and lands. ``--print-recipe`` only prints those steps.
 
-The script leaves ``OHHO_ARM_HARDWARE`` unset and refuses ``--arm``. The
-loopback transport is a simulation target, so this path does not wrap
-``SafetyGate`` (that gate still treats every ``mavlink`` protocol as
-hardware and refuses arm and takeoff when ``CI`` is set).
+``Robot.connect`` wraps the loopback transport in that gate. Under GitHub
+Actions the process connects only when ``OHHO_CI_SIM_ARMING`` and
+``OHHO_CI_SITL`` are both exactly ``1``. That opt-in is the sim-only arming
+exception. The gate's allowlist, geofence, takeoff cap, speed caps, battery
+and link checks, setpoint-before-arm rule, e-stop latch, and watchdogs stay
+enforced. The script leaves ``OHHO_ARM_HARDWARE`` unset and refuses ``--arm``.
 
 Nothing in this module opens a socket unless ``--fly`` is passed.
 """
@@ -70,6 +73,9 @@ ARDUPILOT_VENV_PIP_PACKAGES = (
 )
 ROBOT_ID = "px4-sitl"
 
+# Aerial SafetyGate on ohh-305: takeoff cap 3 m, fence altitude 3 m, fence
+# radius 10 m, horizontal speed cap 1.5 m/s. 2.5 m, 0.5 m/s, and a 4 m square
+# from the origin (far corner about 5.7 m) fit those limits. Do not raise them.
 TAKEOFF_ALT_M = 2.5
 TAKEOFF_Z_NED = -TAKEOFF_ALT_M
 ALT_TOL_M = 0.4
@@ -498,6 +504,30 @@ def hardware_arming_refusal(argv: Sequence[str], env: Mapping[str, str]) -> str 
     return None
 
 
+def _github_actions(env: Mapping[str, str]) -> bool:
+    value = env.get("GITHUB_ACTIONS", "")
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def _require_ci_sim_opt_in(env: Mapping[str, str]) -> None:
+    """Refuse to connect on GitHub Actions without the sim-only opt-in.
+
+    ``OHHO_CI_SIM_ARMING`` and ``OHHO_CI_SITL`` must both be exactly ``1``.
+    This does not arm, does not set ``OHHO_ARM_HARDWARE``, and does not
+    bypass ``SafetyGate``. Callers outside GitHub Actions are unchanged.
+    """
+    if not _github_actions(env):
+        return
+    if env.get("OHHO_CI_SIM_ARMING") == "1" and env.get("OHHO_CI_SITL") == "1":
+        return
+    raise Refused(
+        "refusing to connect under GitHub Actions without "
+        "OHHO_CI_SIM_ARMING=1 and OHHO_CI_SITL=1. "
+        "The aerial SafetyGate stays enforced. This script does not "
+        "allocate a fake TTY or set OHHO_ARM_HARDWARE."
+    )
+
+
 def recipe() -> str:
     launch = " ".join(
         ("Tools/autotest/sim_vehicle.py", *SIM_VEHICLE_ARGS)
@@ -508,6 +538,9 @@ def recipe() -> str:
             f"Ohho URI: {SITL_URI}",
             f"MAVSDK 4 connection: {MAVSDK_URL}",
             f"Install: pip install \"{OHHO_PIP_URL}\"",
+            "The square goes through Robot.connect and the aerial SafetyGate.",
+            "Under GitHub Actions, OHHO_CI_SIM_ARMING=1 and OHHO_CI_SITL=1 "
+            "are required before connect.",
             "CI leaves OHHO_ARM_HARDWARE unset.",
             "Headless launch (no DISPLAY, so sim_vehicle logs to /tmp/ArduCopter.log):",
             f"  {launch}",
@@ -519,8 +552,11 @@ def recipe() -> str:
             "ready-to-arm, and GPS fix_type is at least 3. The wait is bounded "
             "and prints each check that is still failing. Arming checks stay "
             "at their defaults.",
-            "3. Arm the autopilot (MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0). "
-            f"A rejected arm is retried {ARM_ATTEMPTS} times.",
+            "3. Arm the aerial SafetyGate, stream a ground-hold offboard setpoint "
+            f"at {STREAM_HZ:g} Hz, and arm the autopilot "
+            "(MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0). "
+            "The gate refuses that arm unless a setpoint was forwarded in the "
+            f"last 300 ms. A rejected arm is retried {ARM_ATTEMPTS} times.",
             f"4. Take off to {TAKEOFF_ALT_M} m. Pass the climb when "
             f"|z_ned + {TAKEOFF_ALT_M}| < {ALT_TOL_M} m for {ALT_HOLD_S:g} s.",
             f"5. Square, {SIDE_M:g} m sides, LOCAL_NED, carrot at {SPEED_MPS} m/s, "
@@ -617,9 +653,10 @@ def fly_square(
     corner_timeout_s: float = CORNER_TIMEOUT_S,
     land_timeout_s: float = LAND_TIMEOUT_S,
 ) -> SquareReport:
-    """Arm, climb, fly the square, land. Raises ``SquareFailed`` on a miss.
+    """Arm the gate, stream a setpoint, arm, climb, fly, and land.
 
     On a miss after the vehicle may be airborne, sends land and does not disarm.
+    A gate refusal stays the exception ``main`` writes into square-result.json.
     """
     period = 1.0 / STREAM_HZ
     try:
@@ -637,7 +674,10 @@ def fly_square(
             land_timeout_s=land_timeout_s,
         )
     except Exception:
-        _call(vehicle, "land")
+        try:
+            _call(vehicle, "land")
+        except Exception as land_exc:
+            print(f"land after failure failed: {land_exc}", file=sys.stderr)
         raise
 
 
@@ -685,6 +725,8 @@ def _fly(
         monotonic=monotonic,
         period_s=period,
     )
+    print("arming the safety gate", flush=True)
+    _call(vehicle, "arm_gate")
     _arm_with_retries(
         vehicle,
         attempts=arm_attempts,
@@ -833,6 +875,42 @@ def _request_vehicle_streams(vehicle: object, now: float) -> None:
         request()
 
 
+def _arm_hold_ned(sample: VehicleSample) -> tuple[float, float, float]:
+    """Ground hold the aerial geofence accepts.
+
+    The cylinder floor is the local origin. A positive NED z is below that
+    floor, so the pre-arm stream uses the current horizontal position and
+    z=0. The square still climbs with takeoff and holds the climbed altitude.
+    """
+    return (sample.x, sample.y, 0.0)
+
+
+def _stream_setpoints(
+    vehicle: object,
+    duration_s: float,
+    *,
+    sleep: Callable[[float], None],
+) -> VehicleSample:
+    """Publish a ground hold at ``STREAM_HZ`` for ``duration_s`` seconds.
+
+    A duration of 0 publishes once and does not sleep. The last publish is
+    the newest setpoint, so the following ``arm_flight`` sees it inside the
+    gate's 300 ms command window when nothing sleeps between the two calls.
+    """
+    period = 1.0 / STREAM_HZ
+    remaining = duration_s
+    while True:
+        sample = _read(vehicle)
+        _raise_if_flags(sample)
+        x, y, z = _arm_hold_ned(sample)
+        _call(vehicle, "stream_setpoint", x, y, z, 0.0)
+        if remaining <= 1e-9:
+            return sample
+        step = period if remaining > period else remaining
+        sleep(step)
+        remaining -= step
+
+
 def _arm_with_retries(
     vehicle: object,
     *,
@@ -840,11 +918,20 @@ def _arm_with_retries(
     pause_s: float,
     sleep: Callable[[float], None],
 ) -> VehicleSample:
-    """Arm a vehicle that is already armable. A few rejections are retried."""
+    """Arm a vehicle that is already armable. A few rejections are retried.
+
+    The aerial gate refuses ``arm_flight`` unless an offboard setpoint was
+    forwarded in the last 300 ms. This publishes that stream at ``STREAM_HZ``
+    immediately before every arm, and keeps publishing through the settle
+    window and the retry pause.
+    """
     if attempts < 1:
         raise SquareFailed("arm attempts must be at least 1")
+    # Same post-arm pause the readiness fix used before reading ``armed``.
+    settle_s = 0.5
     last_error = "arm was not called"
     for attempt in range(1, attempts + 1):
+        _stream_setpoints(vehicle, 0.0, sleep=sleep)
         print(f"arming autopilot (attempt {attempt}/{attempts})", flush=True)
         try:
             _call(vehicle, "arm")
@@ -852,15 +939,14 @@ def _arm_with_retries(
             last_error = str(exc)
             print(f"arm rejected: {last_error}", flush=True)
         else:
-            sleep(0.5)
-            sample = _read(vehicle)
+            sample = _stream_setpoints(vehicle, settle_s, sleep=sleep)
             _raise_if_flags(sample)
             if sample.armed:
                 return sample
             last_error = "arm call returned but the autopilot stayed disarmed"
             print(f"arm rejected: {last_error}", flush=True)
         if attempt < attempts:
-            sleep(pause_s)
+            _stream_setpoints(vehicle, pause_s, sleep=sleep)
     raise SquareFailed(
         f"autopilot did not arm after {attempts} attempts: {last_error}"
     )
@@ -948,6 +1034,8 @@ class _FlightRobot(Protocol):
     """The Ohho ``Robot`` methods this square calls. Imported only for ``--fly``."""
 
     def telemetry(self) -> object: ...
+
+    def arm(self) -> object: ...
 
     def arm_flight(self) -> object: ...
 
@@ -1037,14 +1125,30 @@ def _target_system_id(system: object) -> int:
     return 1
 
 
+def _mavlink_transport(robot: object) -> object | None:
+    """Inner MAVLink transport when a SafetyGate wraps it.
+
+    Readiness uses this only to find the open MAVSDK session. It does not
+    send arm or takeoff on that object.
+    """
+    transport = getattr(robot, "transport", None)
+    if transport is None:
+        return None
+    inner = getattr(transport, "_inner", None)
+    if inner is not None:
+        return inner
+    return transport
+
+
 def _autopilot_system(robot: object) -> object | None:
     """MAVSDK system kept alive by the transport's action plugin.
 
     ohho-os does not publish health. MAVSDK 4 stores the system on the
     plugin as ``_owner``. A new ``udpin`` connection would take the only
-    SITL stream away from that session.
+    SITL stream away from that session. A SafetyGate hides the link on
+    ``_inner``; this reads that inner transport and does not command it.
     """
-    transport = getattr(robot, "transport", None)
+    transport = _mavlink_transport(robot)
     link = getattr(transport, "_link", None)
     if link is None:
         return None
@@ -1211,10 +1315,12 @@ class CopterReadinessWatch:
 
 
 class OhhoVehicle:
-    """``Robot`` flight methods on one loopback MAVLink transport.
+    """Aerial ``SafetyGate`` flight methods on one loopback MAVLink transport.
 
     ``frame`` is the Ohho ``Frame`` passed to every position setpoint. The
-    opener passes ``Frame.LOCAL_NED``.
+    opener passes ``Frame.LOCAL_NED``. ``arm_gate`` is ``Robot.arm``. The
+    autopilot arm is ``arm_flight``. A gate ``last_error`` becomes
+    ``SquareFailed`` so square-result.json reports that refusal.
     """
 
     def __init__(
@@ -1263,60 +1369,150 @@ class OhhoVehicle:
             readiness=self._health.poll(),
         )
 
+    def _gate(self) -> object | None:
+        return getattr(self._robot, "transport", None)
+
+    def _flight(self, label: str, fn: Callable[[], object]) -> None:
+        gate = self._gate()
+        if gate is not None and hasattr(gate, "last_error"):
+            gate.last_error = None
+        fn()
+        if gate is None:
+            return
+        if bool(getattr(gate, "latched", False)):
+            reason = getattr(gate, "latch_reason", None)
+            raise SquareFailed(f"{label} latched the safety gate ({reason})")
+        error = getattr(gate, "last_error", None)
+        if error:
+            raise SquareFailed(f"{label} refused by SafetyGate: {error}")
+
+    def arm_gate(self) -> None:
+        """Arm the safety gate. This does not arm the autopilot."""
+        gate = self._gate()
+        if bool(getattr(gate, "latched", False)):
+            reason = getattr(gate, "latch_reason", None)
+            raise SquareFailed(f"arm latched the safety gate ({reason})")
+        if gate is not None and hasattr(gate, "last_error"):
+            gate.last_error = None
+        ok = self._robot.arm()
+        if ok is False:
+            error = getattr(gate, "last_error", None)
+            detail = f": {error}" if error else ""
+            raise SquareFailed(f"SafetyGate.arm() refused the gate{detail}")
+        if bool(getattr(gate, "latched", False)):
+            reason = getattr(gate, "latch_reason", None)
+            raise SquareFailed(f"arm latched the safety gate ({reason})")
+
     def arm(self) -> None:
-        self._robot.arm_flight()
+        self._flight("arm_flight", self._robot.arm_flight)
 
     def takeoff(self, alt_m: float) -> None:
-        self._robot.takeoff(alt_m)
+        self._flight("takeoff", lambda: self._robot.takeoff(alt_m))
+
+    def stream_setpoint(self, x: float, y: float, z: float, yaw: float) -> None:
+        self._flight(
+            "offboard_position",
+            lambda: self._robot.offboard_position(x, y, z, yaw, self._frame),
+        )
 
     def goto(self, x: float, y: float, z: float, yaw: float) -> None:
-        self._robot.offboard_position(x, y, z, yaw, self._frame)
+        self.stream_setpoint(x, y, z, yaw)
 
     def land(self) -> None:
-        self._robot.land()
+        self._flight("land", self._robot.land)
 
     def disarm(self) -> None:
-        self._robot.disarm_flight()
+        self._flight("disarm_flight", self._robot.disarm_flight)
 
     def close(self) -> None:
         self._health.close()
         self._robot.disconnect()
 
 
-def open_sitl() -> OhhoVehicle:
-    """Connect ``Robot`` to loopback SITL. Does not wrap ``SafetyGate``.
+def _refuse_unless_loopback_sitl(uri: str) -> None:
+    """Check the MAVSDK URL and the loopback flag before any socket."""
+    from ohho.adapters.mavlink_drone import parse_mavlink_uri
 
-    ``Robot.connect`` would wrap the mavlink transport in the gate. The gate
-    still classifies protocol ``mavlink`` as hardware, and a ``CI`` environment
-    refuses arm and takeoff. The transport flag on this URI is the simulation
-    target: ``requires_hardware_arming`` is false. CI leaves
-    ``OHHO_ARM_HARDWARE`` unset. There is no TTY phrase.
+    target = parse_mavlink_uri(uri)
+    if target.mavsdk_url != MAVSDK_URL:
+        raise Refused(f"refusing unexpected MAVSDK URL {target.mavsdk_url}")
+    if not target.simulation_target or target.requires_hardware_arming:
+        raise Refused("refusing a mavlink target that is not loopback SITL")
+
+
+def _assert_aerial_gate(robot: object, safety_gate_type: type[object]) -> None:
+    """Fail loudly unless ``Robot.connect`` wrapped an aerial SafetyGate."""
+    gate = getattr(robot, "transport", None)
+    if not isinstance(gate, safety_gate_type):
+        raise Refused(
+            "SITL connected without a SafetyGate. "
+            "Robot.connect must wrap the mavlink transport."
+        )
+    profile = getattr(gate, "profile", None)
+    if getattr(profile, "aerial", False) is not True:
+        raise Refused("SafetyGate profile is not the aerial profile")
+    inner = getattr(gate, "_inner", None)
+    if inner is None:
+        raise Refused("SafetyGate has no wrapped mavlink transport")
+    mavsdk_url = getattr(inner, "mavsdk_url", None)
+    if mavsdk_url != MAVSDK_URL:
+        raise Refused(f"refusing unexpected MAVSDK URL {mavsdk_url}")
+    simulation = getattr(inner, "simulation_target", False) is True
+    hardware = getattr(inner, "requires_hardware_arming", True) is not False
+    if not simulation or hardware:
+        raise Refused("refusing a mavlink target that is not loopback SITL")
+    if getattr(gate, "requires_hardware_arming", False):
+        raise Refused(
+            "SafetyGate.requires_hardware_arming is true for this loopback "
+            "mavlink SITL target. Refusing to set OHHO_ARM_HARDWARE. "
+            "GitHub Actions must set OHHO_CI_SIM_ARMING=1 and OHHO_CI_SITL=1 "
+            "with OHHO_ARM_HARDWARE absent."
+        )
+
+
+def open_sitl() -> OhhoVehicle:
+    """Connect via ``Robot.connect`` so the aerial ``SafetyGate`` wraps SITL.
+
+    Under GitHub Actions this returns before connecting unless
+    ``OHHO_CI_SIM_ARMING`` and ``OHHO_CI_SITL`` are both exactly ``1``.
+    The loopback and MAVSDK URL checks run before the socket, and again on
+    the wrapped transport. ``OHHO_ARM_HARDWARE`` is refused whenever it is
+    present. The returned vehicle fails if the transport is not an aerial gate.
     """
     if "OHHO_ARM_HARDWARE" in os.environ:
         raise Refused(
             "refusing because OHHO_ARM_HARDWARE is set; CI leaves that variable unset"
         )
+    _require_ci_sim_opt_in(os.environ)
+    _refuse_unless_loopback_sitl(SITL_URI)
     from ohho.adapters.mavlink_drone import MavlinkDroneTransport
     from ohho.aerial import Frame
-    from ohho.registry import get_spec
     from ohho.robot import Robot
-    from ohho.runtime import get_runtime
+    from ohho.safety import SafetyGate
 
-    spec = get_spec(ROBOT_ID)
-    transport = MavlinkDroneTransport(
-        spec, SITL_URI, timeout_s=DISCOVERY_TIMEOUT_S
-    )
-    if transport.mavsdk_url != MAVSDK_URL:
-        raise Refused(f"refusing unexpected MAVSDK URL {transport.mavsdk_url}")
-    if not transport.simulation_target or transport.requires_hardware_arming:
-        raise Refused("refusing a mavlink target that is not loopback SITL")
-    runtime = get_runtime("native")
-    robot = Robot(spec, transport, runtime)
-    transport.connect()
+    # Robot.connect does not take a discovery timeout. The square's wait for
+    # the first autopilot stays DISCOVERY_TIMEOUT_S (120 s), not the adapter
+    # default of 10 s.
+    init = MavlinkDroneTransport.__init__
+    defaults = getattr(init, "__kwdefaults__", None)
+    if not isinstance(defaults, dict) or "timeout_s" not in defaults:
+        raise Refused(
+            "mavlink transport has no timeout_s default; "
+            "refusing to connect with a shorter discovery wait"
+        )
+    saved_timeout = defaults["timeout_s"]
+    defaults["timeout_s"] = DISCOVERY_TIMEOUT_S
     try:
-        runtime.start()
+        robot = Robot.connect(ROBOT_ID, SITL_URI, runtime="native")
+    finally:
+        defaults["timeout_s"] = saved_timeout
+    try:
+        _assert_aerial_gate(robot, SafetyGate)
     except Exception:
-        transport.disconnect()
+        try:
+            robot.disconnect()
+        except Exception:
+            pass
         raise
     return OhhoVehicle(robot, Frame.LOCAL_NED)
 

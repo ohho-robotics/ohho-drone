@@ -75,6 +75,19 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend"
+          python -m pip show ohho-os
+          python - <<'PY'
+          import importlib.metadata
+          import pathlib
+
+          dist = importlib.metadata.distribution("ohho-os")
+          direct = pathlib.Path(str(dist.locate_file("direct_url.json")))
+          print("ohho-os direct_url:")
+          if direct.is_file():
+              print(direct.read_text(encoding="utf-8"))
+          else:
+              print("direct_url.json missing")
+          PY
 
       - name: Clone ArduPilot Copter-4.7.2
         run: |
@@ -165,6 +178,9 @@ jobs:
           fi
 
       - name: Fly the square through mavlink+udp://127.0.0.1:14540
+        env:
+          OHHO_CI_SIM_ARMING: "1"
+          OHHO_CI_SITL: "1"
         run: |
           set -euo pipefail
           python scripts/ardupilot_sitl_square.py --fly --result "${GITHUB_WORKSPACE}/square-result.json"
