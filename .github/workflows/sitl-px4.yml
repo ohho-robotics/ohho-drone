@@ -18,6 +18,7 @@ on:
       - ".github/workflows/sitl-px4.yml"
       - "scripts/sitl_square.py"
       - "scripts/run_sitl_px4.sh"
+      - "scripts/relay_px4_topics.py"
       - "tests/test_sitl_square.py"
       - "docs/sitl-px4.md"
 
@@ -118,7 +119,9 @@ jobs:
           mkdir -p artifacts
           sudo chown -R "$(id -u):$(id -g)" artifacts
           if [ -f artifacts/px4-console.log ]; then
-            tail -n 200 artifacts/px4-console.log > artifacts/px4-console-tail.txt
+            # Same bound as write_console_tail in scripts/run_sitl_px4.sh.
+            # tail -n alone copies a newline-free pxh prompt in full.
+            tail -c 262144 artifacts/px4-console.log | tail -n 200 > artifacts/px4-console-tail.txt
           fi
 
       - name: Upload logs and ulog

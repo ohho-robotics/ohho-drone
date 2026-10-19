@@ -12,6 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import relay_px4_topics  # noqa: E402
 import sitl_square  # noqa: E402
 
 
@@ -340,6 +341,8 @@ class WorkflowFileTest(unittest.TestCase):
             "actions/upload-artifact@v4",
             "if: always()",
             "px4-console-tail.txt",
+            "scripts/relay_px4_topics.py",
+            "tail -c 262144 artifacts/px4-console.log | tail -n 200 > artifacts/px4-console-tail.txt",
             "GITHUB_ACTIONS",
             'sudo chown -R "$(id -u):$(id -g)" artifacts',
         ):
@@ -347,6 +350,10 @@ class WorkflowFileTest(unittest.TestCase):
         self.assertLess(
             text.index('sudo chown -R "$(id -u):$(id -g)" artifacts'),
             text.index("artifacts/px4-console-tail.txt"),
+        )
+        self.assertNotIn(
+            "tail -n 200 artifacts/px4-console.log > artifacts/px4-console-tail.txt",
+            text,
         )
         self.assertNotIn("OHHO_ARM_HARDWARE=", text)
         self.assertNotIn("-e OHHO_ARM_HARDWARE", text)
@@ -379,8 +386,20 @@ class WorkflowFileTest(unittest.TestCase):
             "submodule update --init -- Tools/simulation/gz",
             "worlds/default.sdf",
             "build gz_x500:",
+            "bc=1.07.1-3ubuntu4",
+            "GZ_IP=127.0.0.1",
+            'bin/px4" -d',
+            "Startup script returned successfully",
+            "tail -c 262144",
+            "write_console_tail",
+            "scripts/relay_px4_topics.py",
         ):
             self.assertIn(required, script, required)
+        self.assertNotIn("make px4_sitl gz_x500", script)
+        self.assertLess(
+            script.index("scripts/relay_px4_topics.py"),
+            script.index('scripts/sitl_square.py"'),
+        )
         self.assertLess(
             script.index("\ninstall_px4_sim_deps\n"),
             script.index("\nbuild_px4\n"),
@@ -398,6 +417,27 @@ class WorkflowFileTest(unittest.TestCase):
         self.assertNotIn("--privileged", script)
         self.assertNotIn("--network host", script)
         self.assertNotIn("21196", script)
+
+    def test_relay_mirrors_only_versioned_telemetry(self) -> None:
+        pairs = {(source, dest) for _name, source, dest in relay_px4_topics.RELAYS}
+        self.assertEqual(
+            pairs,
+            {
+                ("/fmu/out/vehicle_status_v1", "/fmu/out/vehicle_status"),
+                (
+                    "/fmu/out/vehicle_local_position_v1",
+                    "/fmu/out/vehicle_local_position",
+                ),
+                ("/fmu/out/battery_status_v1", "/fmu/out/battery_status"),
+            },
+        )
+        source = Path(relay_px4_topics.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("/fmu/in/", source)
+        self.assertNotIn("vehicle_command", source)
+        self.assertNotIn("OHHO_ARM_HARDWARE", source)
+        self.assertNotIn("--arm", source)
+        self.assertIn("TRANSIENT_LOCAL", source)
+        self.assertIn("BEST_EFFORT", source)
 
 
 if __name__ == "__main__":

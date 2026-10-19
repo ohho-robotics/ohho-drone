@@ -33,7 +33,10 @@ on Ubuntu 24.04, so it does not contain Gazebo, OpenCV, or the SITL binary.
 `ubuntu.sh` packages the gz plugins need (`libopencv-dev` for
 `gz_plugins/optical_flow`, `libgstreamer-plugins-base1.0-dev`, `cppzmq-dev`
 on Ubuntu 24.04, plus Eigen, unwind, pkg-config, and protobuf), and builds
-the `v1.17.0` tag inside that image.
+the `v1.17.0` tag inside that image. It also installs the Ubuntu 24.04
+package `bc=1.07.1-3ubuntu4`. The stock `rcS` uses `bc` to scale
+`COM_DL_LOSS_T`, `COM_RC_LOSS_T`, `COM_OF_LOSS_T`, and `COM_OBC_LOSS_T` with
+`PX4_SIM_SPEED_FACTOR`. This repo does not set those parameters.
 
 `gz_bridge/CMakeLists.txt` in that tag adds the `gz_x500` ninja target only
 when `Tools/simulation/gz/worlds/*.sdf` exists during configure. That path is
@@ -52,7 +55,12 @@ be compared with that budget. The image cache key is the index digest above.
 
 The job fails unless all of these are true:
 
-- `/fmu/out/vehicle_status` shows up within 120 s.
+- `/fmu/out/vehicle_status` shows up within 120 s. PX4 v1.17 publishes
+  that message on `/fmu/out/vehicle_status_v1` (`MESSAGE_VERSION` 1). The
+  same suffix is on `vehicle_local_position` and `battery_status`.
+  `scripts/relay_px4_topics.py` copies those three topics onto the
+  unversioned names `ohh-290-px4-dds` subscribes to, with best-effort
+  transient-local QoS. It does not publish `/fmu/in/*`.
 - After takeoff, `|z_ned + 2.5| < 0.4` m for 2 s.
 - The square has 4 m sides in local NED, flown at 0.5 m/s with altitude held.
   Each corner is accepted only when the horizontal error is within 0.8 m and
@@ -125,8 +133,12 @@ Confirm the image digest is the index or amd64 digest in the table before
 trusting a retag of `v1.17.0`. `scripts/run_sitl_px4.sh` checks out PX4
 `v1.17.0`, installs the simulation packages above, checks out the Gazebo
 models submodule, builds `px4_sitl_default`, starts `MicroXRCEAgent udp4 -p
-8888`, then runs `HEADLESS=1 PX4_SIM_MODEL=gz_x500 PX4_SIM_SPEED_FACTOR=1
-make px4_sitl gz_x500`. The Ohho process is `scripts/sitl_square.py`.
+8888`, then runs `bin/px4 -d` with `HEADLESS=1`, `PX4_SIM_MODEL=gz_x500`,
+`PX4_GZ_WORLD=default`, `PX4_SIM_SPEED_FACTOR=1`, and `GZ_IP=127.0.0.1`.
+`-d` is daemon mode, so the `pxh` shell does not run. The `gz_x500` cmake
+target launches the same binary without `-d`; that shell reads stdin, and a
+redirect from `/dev/null` makes it print `pxh> ` until the log is huge.
+The Ohho process is `scripts/sitl_square.py`, after the topic relay.
 
 Mission rules without a simulator:
 
@@ -141,8 +153,10 @@ directory as root. After `docker rm`, the workflow runs `sudo chown -R` so
 the runner can replace `px4-console-tail.txt` and the upload can read the
 files.
 
-- `px4-console.log` and `px4-console-tail.txt` (last 200 lines)
+- `px4-console.log` and `px4-console-tail.txt` (last 200 lines of the last
+  256 KiB, so a newline-free prompt cannot copy the whole console)
 - `xrce-agent.log`
+- `topic-relay.log`
 - `sitl-result.json` (criteria, phases, corner errors, failsafes, duration)
 - any `*.ulg` logs the PX4 build wrote
 

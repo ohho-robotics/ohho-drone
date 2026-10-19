@@ -108,11 +108,17 @@ install_px4_sim_deps() {
     pkg-config
     protobuf-compiler
   )
-  if [ "${VERSION_ID:-}" = "24.04" ]; then
-    packages+=(cppzmq-dev)
+  if [ "${VERSION_ID:-}" != "24.04" ]; then
+    echo "bc is pinned to Ubuntu 24.04 package 1.07.1-3ubuntu4; got ${VERSION_ID:-unset}" >&2
+    exit 1
   fi
+  # rcS scales COM_DL_LOSS_T, COM_RC_LOSS_T, COM_OF_LOSS_T, and COM_OBC_LOSS_T
+  # with bc. This repo does not set those parameters; the stock startup script
+  # does, once bc exists. Noble publishes this exact binary.
+  packages+=(cppzmq-dev "bc=1.07.1-3ubuntu4")
   apt_get update -y --quiet
   apt_get install -y --no-install-recommends "${packages[@]}"
+  command -v bc >/dev/null
 }
 
 install_ros() {
@@ -211,6 +217,17 @@ install_ohho() {
 
 AGENT_PID=""
 PX4_PID=""
+RELAY_PID=""
+
+# GNU tail -n copies an entire line. The pxh prompt is "pxh> " with no newline,
+# so an unbounded tail -n reproduced the whole console (run 39300774890, 1.1 GB).
+# Read only the last 256 KiB, then keep the last 200 lines of that slice.
+write_console_tail() {
+  local src="$1" dest="$2"
+  if [ -f "$src" ]; then
+    tail -c 262144 "$src" | tail -n 200 > "$dest"
+  fi
+}
 
 copy_logs() {
   local status="$1"
@@ -224,10 +241,12 @@ copy_logs() {
     kill "$AGENT_PID" 2>/dev/null
     wait "$AGENT_PID" 2>/dev/null
   fi
-  mkdir -p "$ARTIFACT_DIR"
-  if [ -f "$ARTIFACT_DIR/px4-console.log" ]; then
-    tail -n 200 "$ARTIFACT_DIR/px4-console.log" > "$ARTIFACT_DIR/px4-console-tail.txt"
+  if [ -n "$RELAY_PID" ]; then
+    kill "$RELAY_PID" 2>/dev/null
+    wait "$RELAY_PID" 2>/dev/null
   fi
+  mkdir -p "$ARTIFACT_DIR"
+  write_console_tail "$ARTIFACT_DIR/px4-console.log" "$ARTIFACT_DIR/px4-console-tail.txt"
   if [ -d "$PX4_SRC" ]; then
     find "$PX4_SRC" -name '*.ulg' -print 2>/dev/null \
       | while IFS= read -r ulog; do
@@ -259,19 +278,23 @@ if ! kill -0 "$AGENT_PID" 2>/dev/null; then
 fi
 
 log "starting headless gz_x500 at speed factor 1"
+# The gz_x500 cmake target runs bin/px4 with no arguments, so pxh reads stdin.
+# docker exec has no TTY and this redirect is /dev/null, so the prompt spins
+# and fills the console log. -d is daemon mode: rcS still runs, pxh does not.
 # setsid forks when this shell is already a session leader, and $! would be
 # that parent. The child records its own pid, which stays the session leader
-# across the exec into make.
+# across the exec into px4.
 rm -f "$ARTIFACT_DIR/px4.pid"
 setsid bash -c '
   echo $$ > "$4/px4.pid"
-  cd "$1"
+  cd "$1/build/px4_sitl_default"
   exec env HEADLESS=1 \
     PX4_SIM_MODEL=gz_x500 \
     PX4_GZ_WORLD="$2" \
     PX4_SIM_SPEED_FACTOR=1 \
     LIBGL_ALWAYS_SOFTWARE="$3" \
-    make px4_sitl gz_x500
+    GZ_IP=127.0.0.1 \
+    "$1/build/px4_sitl_default/bin/px4" -d
 ' bash "$PX4_SRC" "$PX4_GZ_WORLD" "$LIBGL_ALWAYS_SOFTWARE" "$ARTIFACT_DIR" \
   > "$ARTIFACT_DIR/px4-console.log" 2>&1 < /dev/null &
 PX4_PID=""
@@ -291,10 +314,11 @@ ready=0
 for _ in $(seq 1 180); do
   if ! kill -0 "$PX4_PID" 2>/dev/null; then
     echo "PX4 exited during startup" >&2
-    tail -n 200 "$ARTIFACT_DIR/px4-console.log" >&2 || true
+    write_console_tail "$ARTIFACT_DIR/px4-console.log" "$ARTIFACT_DIR/px4-console-tail.txt"
+    cat "$ARTIFACT_DIR/px4-console-tail.txt" >&2 || true
     exit 1
   fi
-  if grep -E -q "Ready for takeoff|pxh>|gz_bridge" "$ARTIFACT_DIR/px4-console.log"; then
+  if grep -E -q "Startup script returned successfully" "$ARTIFACT_DIR/px4-console.log"; then
     ready=1
     break
   fi
@@ -311,6 +335,15 @@ source /opt/ros/jazzy/setup.bash
 # shellcheck disable=SC1091
 source "$PX4_WS/install/setup.bash"
 set -u
+log "relaying versioned PX4 topics onto the names Ohho subscribes to"
+python3 "$REPO_DIR/scripts/relay_px4_topics.py" > "$ARTIFACT_DIR/topic-relay.log" 2>&1 &
+RELAY_PID=$!
+sleep 1
+if ! kill -0 "$RELAY_PID" 2>/dev/null; then
+  echo "topic relay exited" >&2
+  cat "$ARTIFACT_DIR/topic-relay.log" >&2 || true
+  exit 1
+fi
 python3 "$REPO_DIR/scripts/sitl_square.py" \
   --uri px4+dds://127.0.0.1:8888 \
   --result "$ARTIFACT_DIR/sitl-result.json"
