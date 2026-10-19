@@ -1,8 +1,9 @@
 """D-07 square on ArduPilot Copter SITL through Ohho ``mavlink+udp://``.
 
 OHH-306. The workflow starts ``sim_vehicle.py -v ArduCopter`` headless at the
-pinned Copter-4.7.2 tag, then this script arms, climbs to 2.5 m, flies a 4 m
-square, and lands. ``--print-recipe`` only prints those steps.
+pinned Copter-4.7.2 tag, then this script waits until MAVSDK health says the
+copter is armable, arms, climbs to 2.5 m, flies a 4 m square, and lands.
+``--print-recipe`` only prints those steps.
 
 The script leaves ``OHHO_ARM_HARDWARE`` unset and refuses ``--arm``. The
 loopback transport is a simulation target, so this path does not wrap
@@ -19,6 +20,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Protocol, Sequence
@@ -81,7 +83,12 @@ DISARM_ALT_M = 0.25
 DISCOVERY_TIMEOUT_S = 120.0
 
 GROUND_TIMEOUT_S = 90.0
+# Copter pre-arm (EKF / AHRS / home) usually passes 20-60 s after boot.
+# This bounds the wait. It does not change the climb, corner, or land budgets.
 ARM_TIMEOUT_S = 90.0
+ARM_ATTEMPTS = 3
+ARM_RETRY_PAUSE_S = 2.0
+ARM_READY_LOG_S = 5.0
 CLIMB_TIMEOUT_S = 90.0
 CORNER_TIMEOUT_S = 45.0
 LAND_TIMEOUT_S = 60.0
@@ -120,6 +127,134 @@ class Refused(Exception):
     """The process was asked to arm hardware, or the URI is not loopback SITL."""
 
 
+# MAVSDK Telemetry.Health fields. The first three gate arming. The rest are
+# logged while those three are still false so the timeout names the cause.
+_REQUIRED_HEALTH = (
+    ("is_armable", "is_armable"),
+    ("is_global_position_ok", "global position"),
+    ("is_home_position_ok", "home position"),
+)
+_OPTIONAL_HEALTH = (
+    ("is_local_position_ok", "local position"),
+    ("is_accelerometer_calibration_ok", "accelerometer calibration"),
+    ("is_gyrometer_calibration_ok", "gyrometer calibration"),
+    ("is_magnetometer_calibration_ok", "magnetometer calibration"),
+)
+_HEALTH_FIELDS = tuple(name for name, _label in _REQUIRED_HEALTH + _OPTIONAL_HEALTH)
+
+
+@dataclass(frozen=True)
+class ArmReadiness:
+    """MAVSDK health, or the same flags when Ohho publishes them.
+
+    ``ready`` is is_armable plus a global position and a home position.
+    Calibration and local-position flags are diagnostic. A false compass bit
+    on SITL does not block once the pre-arm bit is set.
+    """
+
+    reported: bool = False
+    is_armable: bool | None = None
+    is_global_position_ok: bool | None = None
+    is_home_position_ok: bool | None = None
+    is_local_position_ok: bool | None = None
+    is_accelerometer_calibration_ok: bool | None = None
+    is_gyrometer_calibration_ok: bool | None = None
+    is_magnetometer_calibration_ok: bool | None = None
+
+    def ready(self) -> bool:
+        return (
+            self.reported
+            and self.is_armable is True
+            and self.is_global_position_ok is True
+            and self.is_home_position_ok is True
+        )
+
+    def blockers(self) -> tuple[str, ...]:
+        """Checks that still refuse the arm."""
+        if not self.reported:
+            return ("mavsdk health not received",)
+        failed: list[str] = []
+        for attr, label in _REQUIRED_HEALTH:
+            if getattr(self, attr) is not True:
+                failed.append(label)
+        return tuple(failed)
+
+    def detail(self) -> tuple[str, ...]:
+        """Blockers plus calibration and local-position flags that are false."""
+        extra: list[str] = []
+        if self.reported:
+            for attr, label in _OPTIONAL_HEALTH:
+                if getattr(self, attr) is False:
+                    extra.append(label)
+        return self.blockers() + tuple(extra)
+
+
+def arm_readiness_ok() -> ArmReadiness:
+    """Health that may arm. Tests use this as the default sample."""
+    return ArmReadiness(
+        reported=True,
+        is_armable=True,
+        is_global_position_ok=True,
+        is_home_position_ok=True,
+        is_local_position_ok=True,
+        is_accelerometer_calibration_ok=True,
+        is_gyrometer_calibration_ok=True,
+        is_magnetometer_calibration_ok=True,
+    )
+
+
+def _health_flag(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def arm_readiness_from_mapping(payload: Mapping[str, object]) -> ArmReadiness | None:
+    """Build readiness from a dict that contains ``is_armable``."""
+    if "is_armable" not in payload:
+        return None
+    flags = {name: _health_flag(payload.get(name)) for name in _HEALTH_FIELDS}
+    if not any(flag is not None for flag in flags.values()):
+        return None
+    return ArmReadiness(reported=True, **flags)
+
+
+def arm_readiness_from_health(health: object) -> ArmReadiness | None:
+    """Build readiness from a MAVSDK ``Health`` object."""
+    if health is None:
+        return None
+    payload = {name: getattr(health, name, None) for name in _HEALTH_FIELDS}
+    return arm_readiness_from_mapping(payload)
+
+
+def _string_mapping(value: object) -> Mapping[str, object] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {str(key): item for key, item in value.items()}
+
+
+def arm_readiness_from_telemetry(
+    custom: Mapping[str, object], drone: Mapping[str, object]
+) -> ArmReadiness | None:
+    """Ohho-published health, when the backend has started sending it.
+
+    Checked before the direct MAVSDK plugin. ``custom["arm_health"]`` is the
+    place that does not change ``DRONE_TELEMETRY_KEYS``.
+    """
+    for source in (
+        custom.get("arm_health"),
+        drone.get("health"),
+        drone if "is_armable" in drone else None,
+    ):
+        payload = _string_mapping(source)
+        if payload is None:
+            continue
+        parsed = arm_readiness_from_mapping(payload)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 @dataclass(frozen=True)
 class VehicleSample:
     x: float
@@ -130,6 +265,7 @@ class VehicleSample:
     flight_mode: str
     failsafe: tuple[str, ...]
     link_ok: bool
+    readiness: ArmReadiness = field(default_factory=arm_readiness_ok)
 
 
 @dataclass
@@ -255,13 +391,17 @@ def recipe() -> str:
             f"  {launch}",
             "",
             "1. Wait until the autopilot reports on_ground on the loopback link.",
-            "2. Arm the autopilot (MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0).",
-            f"3. Take off to {TAKEOFF_ALT_M} m. Pass the climb when "
+            "2. Wait until MAVSDK health reports is_armable, a global position, "
+            "and a home position. The wait is bounded and prints each check "
+            "that is still failing. Arming checks stay at their defaults.",
+            "3. Arm the autopilot (MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0). "
+            f"A rejected arm is retried {ARM_ATTEMPTS} times.",
+            f"4. Take off to {TAKEOFF_ALT_M} m. Pass the climb when "
             f"|z_ned + {TAKEOFF_ALT_M}| < {ALT_TOL_M} m for {ALT_HOLD_S:g} s.",
-            f"4. Square, {SIDE_M:g} m sides, LOCAL_NED, carrot at {SPEED_MPS} m/s, "
+            f"5. Square, {SIDE_M:g} m sides, LOCAL_NED, carrot at {SPEED_MPS} m/s, "
             "altitude held, setpoints at "
             f"{STREAM_HZ:g} Hz. Each corner within {CORNER_TOL_M} m horizontal.",
-            "5. Land. Pass when landed_state is on_ground, motors are disarmed "
+            "6. Land. Pass when landed_state is on_ground, motors are disarmed "
             "with a normal disarm, and no failsafe flag was set after takeoff.",
             "",
             "This process connects only when --fly is passed.",
@@ -346,6 +486,8 @@ def fly_square(
     monotonic: Callable[[], float] = time.monotonic,
     ground_timeout_s: float = GROUND_TIMEOUT_S,
     arm_timeout_s: float = ARM_TIMEOUT_S,
+    arm_attempts: int = ARM_ATTEMPTS,
+    arm_retry_pause_s: float = ARM_RETRY_PAUSE_S,
     climb_timeout_s: float = CLIMB_TIMEOUT_S,
     corner_timeout_s: float = CORNER_TIMEOUT_S,
     land_timeout_s: float = LAND_TIMEOUT_S,
@@ -363,6 +505,8 @@ def fly_square(
             period=period,
             ground_timeout_s=ground_timeout_s,
             arm_timeout_s=arm_timeout_s,
+            arm_attempts=arm_attempts,
+            arm_retry_pause_s=arm_retry_pause_s,
             climb_timeout_s=climb_timeout_s,
             corner_timeout_s=corner_timeout_s,
             land_timeout_s=land_timeout_s,
@@ -392,6 +536,8 @@ def _fly(
     period: float,
     ground_timeout_s: float,
     arm_timeout_s: float,
+    arm_attempts: int,
+    arm_retry_pause_s: float,
     climb_timeout_s: float,
     corner_timeout_s: float,
     land_timeout_s: float,
@@ -407,8 +553,19 @@ def _fly(
         on_fail="no on_ground telemetry before arm",
     )
 
-    print("arming autopilot", flush=True)
-    _arm_until(vehicle, arm_timeout_s, sleep=sleep, monotonic=monotonic)
+    _wait_until_armable(
+        vehicle,
+        arm_timeout_s,
+        sleep=sleep,
+        monotonic=monotonic,
+        period_s=period,
+    )
+    _arm_with_retries(
+        vehicle,
+        attempts=arm_attempts,
+        pause_s=arm_retry_pause_s,
+        sleep=sleep,
+    )
 
     print(f"takeoff to {TAKEOFF_ALT_M} m", flush=True)
     _call(vehicle, "takeoff", TAKEOFF_ALT_M)
@@ -486,23 +643,88 @@ def _fly(
     return report
 
 
-def _arm_until(
+def _arm_blockers(sample: VehicleSample) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if not sample.link_ok:
+        reasons.append("link down")
+    if sample.landed_state != "on_ground":
+        reasons.append(f"landed_state is {sample.landed_state}")
+    if not sample.readiness.ready():
+        reasons.extend(sample.readiness.detail())
+    return tuple(reasons)
+
+
+def _wait_until_armable(
     vehicle: object,
     timeout_s: float,
     *,
     sleep: Callable[[float], None],
     monotonic: Callable[[], float],
+    period_s: float,
 ) -> VehicleSample:
+    """Block until health says the copter can arm. Do not send an arm command."""
+    note = getattr(vehicle, "arm_health_note", None)
+    if isinstance(note, str) and note:
+        print(note, flush=True)
+    print("waiting until the autopilot is armable", flush=True)
     deadline = monotonic() + timeout_s
-    last: VehicleSample | None = None
+    started = monotonic()
+    last_text: str | None = None
+    last_log = started
+    reasons: tuple[str, ...] = ("mavsdk health not received",)
     while monotonic() < deadline:
-        _call(vehicle, "arm")
-        sleep(0.5)
-        last = _read(vehicle)
-        _raise_if_flags(last)
-        if last.armed:
-            return last
-    raise SquareFailed("autopilot did not arm")
+        sample = _read(vehicle)
+        _raise_if_flags(sample)
+        reasons = _arm_blockers(sample)
+        if not reasons:
+            print("autopilot is armable", flush=True)
+            return sample
+        text = ", ".join(reasons)
+        now = monotonic()
+        if text != last_text or now - last_log >= ARM_READY_LOG_S:
+            print(
+                f"not armable yet ({now - started:.0f}s): {text}",
+                flush=True,
+            )
+            last_text = text
+            last_log = now
+        sleep(period_s)
+    raise SquareFailed(
+        f"not armable within {timeout_s:g}s: {', '.join(reasons)}"
+    )
+
+
+def _arm_with_retries(
+    vehicle: object,
+    *,
+    attempts: int,
+    pause_s: float,
+    sleep: Callable[[float], None],
+) -> VehicleSample:
+    """Arm a vehicle that is already armable. A few rejections are retried."""
+    if attempts < 1:
+        raise SquareFailed("arm attempts must be at least 1")
+    last_error = "arm was not called"
+    for attempt in range(1, attempts + 1):
+        print(f"arming autopilot (attempt {attempt}/{attempts})", flush=True)
+        try:
+            _call(vehicle, "arm")
+        except SquareFailed as exc:
+            last_error = str(exc)
+            print(f"arm rejected: {last_error}", flush=True)
+        else:
+            sleep(0.5)
+            sample = _read(vehicle)
+            _raise_if_flags(sample)
+            if sample.armed:
+                return sample
+            last_error = "arm call returned but the autopilot stayed disarmed"
+            print(f"arm rejected: {last_error}", flush=True)
+        if attempt < attempts:
+            sleep(pause_s)
+    raise SquareFailed(
+        f"autopilot did not arm after {attempts} attempts: {last_error}"
+    )
 
 
 def _check_cruise(sample: VehicleSample) -> None:
@@ -603,6 +825,133 @@ class _FlightRobot(Protocol):
     def disconnect(self) -> None: ...
 
 
+def _mavsdk_telemetry(system: object) -> object:
+    """Second Telemetry plugin on a system Ohho already discovered.
+
+    This does not open a socket. The SITL stream is already owned by the
+    session that discovered the autopilot.
+    """
+    from mavsdk.plugins.telemetry import Telemetry
+
+    return Telemetry(system)
+
+
+def _autopilot_system(robot: object) -> object | None:
+    """MAVSDK system kept alive by the transport's action plugin.
+
+    ohho-os does not publish health. MAVSDK 4 stores the system on the
+    plugin as ``_owner``. A new ``udpin`` connection would take the only
+    SITL stream away from that session.
+    """
+    transport = getattr(robot, "transport", None)
+    link = getattr(transport, "_link", None)
+    if link is None:
+        return None
+    for attr in ("_action", "_offboard"):
+        plugin = getattr(link, attr, None)
+        owner = getattr(plugin, "_owner", None)
+        if owner is not None and getattr(owner, "_handle", None):
+            return owner
+    sdk = getattr(link, "_sdk", None)
+    getter = getattr(sdk, "get_systems", None)
+    if not callable(getter):
+        return None
+    systems = getter()
+    chosen: object | None = None
+    for system in systems:
+        has_autopilot = getattr(system, "has_autopilot", None)
+        if callable(has_autopilot) and has_autopilot():
+            return system
+        if chosen is None:
+            chosen = system
+    return chosen
+
+
+class ArmHealthWatch:
+    """Poll MAVSDK health on the session Ohho already opened."""
+
+    def __init__(self) -> None:
+        self._plugin: object | None = None
+        self._note = "mavsdk health not attached"
+        self._lock = threading.Lock()
+        self._latest = ArmReadiness()
+
+    @property
+    def note(self) -> str:
+        return self._note
+
+    def attach(
+        self,
+        robot: object,
+        *,
+        telemetry_factory: Callable[[object], object] | None = None,
+    ) -> None:
+        system = _autopilot_system(robot)
+        if system is None:
+            self._note = (
+                "mavsdk health not attached: the open session has no autopilot system"
+            )
+            return
+        factory = _mavsdk_telemetry if telemetry_factory is None else telemetry_factory
+        try:
+            plugin = factory(system)
+        except Exception as exc:
+            self._note = f"mavsdk health not attached: {exc}"
+            return
+        self._plugin = plugin
+        subscribe_error = ""
+        subscribed = False
+        subscribe = getattr(plugin, "subscribe_health", None)
+        if callable(subscribe):
+            try:
+                subscribe(self._on_health)
+                subscribed = True
+            except Exception as exc:
+                subscribe_error = str(exc)
+        can_poll = callable(getattr(plugin, "health", None))
+        if not can_poll and not subscribed:
+            reason = subscribe_error or "telemetry plugin has no health()"
+            self._note = f"mavsdk health not attached: {reason}"
+            self._plugin = None
+            return
+        self._note = "reading MAVSDK health on the open session"
+        if subscribe_error:
+            self._note += f" (subscribe_health failed: {subscribe_error})"
+        self.poll()
+
+    def _on_health(self, health: object, _user_data: object = None) -> None:
+        parsed = arm_readiness_from_health(health)
+        if parsed is None:
+            return
+        with self._lock:
+            self._latest = parsed
+
+    def poll(self) -> ArmReadiness:
+        plugin = self._plugin
+        if plugin is not None:
+            getter = getattr(plugin, "health", None)
+            if callable(getter):
+                try:
+                    parsed = arm_readiness_from_health(getter())
+                except Exception:
+                    parsed = None
+                if parsed is not None:
+                    with self._lock:
+                        self._latest = parsed
+        with self._lock:
+            return self._latest
+
+    def close(self) -> None:
+        plugin = self._plugin
+        self._plugin = None
+        destroy = getattr(plugin, "destroy", None)
+        if callable(destroy):
+            try:
+                destroy()
+            except Exception:
+                return
+
+
 class OhhoVehicle:
     """``Robot`` flight methods on one loopback MAVLink transport.
 
@@ -610,14 +959,29 @@ class OhhoVehicle:
     opener passes ``Frame.LOCAL_NED``.
     """
 
-    def __init__(self, robot: _FlightRobot, frame: object) -> None:
+    def __init__(
+        self,
+        robot: _FlightRobot,
+        frame: object,
+        *,
+        health: ArmHealthWatch | None = None,
+    ) -> None:
         self._robot = robot
         self._frame = frame
+        self._health = ArmHealthWatch() if health is None else health
+        if health is None:
+            self._health.attach(robot)
+
+    @property
+    def arm_health_note(self) -> str:
+        return self._health.note
 
     def read(self) -> VehicleSample:
         tele = self._robot.telemetry()
         custom = getattr(tele, "custom", None)
-        drone = custom.get("drone") if isinstance(custom, Mapping) else None
+        if not isinstance(custom, Mapping):
+            custom = {}
+        drone = custom.get("drone")
         if not isinstance(drone, Mapping):
             raise SquareFailed("mavlink telemetry has no drone sample")
         pose = drone.get("pose")
@@ -626,6 +990,11 @@ class OhhoVehicle:
         flags = drone.get("failsafe") or ()
         if isinstance(flags, str) or not isinstance(flags, Sequence):
             flags = ()
+        custom_map = _string_mapping(custom) or {}
+        drone_map = _string_mapping(drone) or {}
+        readiness = arm_readiness_from_telemetry(custom_map, drone_map)
+        if readiness is None:
+            readiness = self._health.poll()
         return VehicleSample(
             x=float(pose["x"]),
             y=float(pose["y"]),
@@ -635,6 +1004,7 @@ class OhhoVehicle:
             flight_mode=str(drone.get("flight_mode", "unknown")),
             failsafe=tuple(str(flag) for flag in flags),
             link_ok=bool(drone.get("link_ok")),
+            readiness=readiness,
         )
 
     def arm(self) -> None:
@@ -653,6 +1023,7 @@ class OhhoVehicle:
         self._robot.disarm_flight()
 
     def close(self) -> None:
+        self._health.close()
         self._robot.disconnect()
 
 
