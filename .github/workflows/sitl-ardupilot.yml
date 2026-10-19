@@ -9,6 +9,7 @@ name: ArduPilot SITL square
 #
 # Install pin: ohho-os branch ohh-305-mavlink-backend (draft PR #62).
 # Human TODO: after that branch merges, install ohho[mavlink] from main.
+# pip 25.1 rejects #egg=ohho[mavlink], so the step uses the name @ url form.
 
 on:
   workflow_dispatch:
@@ -70,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend#egg=ohho[mavlink]"
+          python -m pip install "ohho[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend"
 
       - name: Clone ArduPilot Copter-4.7.2
         run: |

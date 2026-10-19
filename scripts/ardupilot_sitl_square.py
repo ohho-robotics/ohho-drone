@@ -27,9 +27,11 @@ COPTER_TAG = "Copter-4.7.2"
 COPTER_COMMIT = "fb773567896014da007bca58358704d4a0d8516f"
 SITL_URI = "mavlink+udp://127.0.0.1:14540"
 MAVSDK_URL = "udpin://127.0.0.1:14540"
+# pip 25.1 rejects ``#egg=ohho[mavlink]`` (non-PEP-508 egg name). This is the
+# same branch pin: ohho[mavlink] from ohh-305-mavlink-backend.
 OHHO_PIP_URL = (
-    "git+https://github.com/ohho-robotics/ohho-os"
-    "@ohh-305-mavlink-backend#egg=ohho[mavlink]"
+    "ohho[mavlink] @ git+https://github.com/ohho-robotics/ohho-os"
+    "@ohh-305-mavlink-backend"
 )
 ROBOT_ID = "px4-sitl"
 
