@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""Fly arm, 2.5 m, a 4 m square, and land through Ohho on loopback PX4 SITL.
+
+The vehicle commands go through ``Robot`` and the aerial ``SafetyGate``. This
+script does not set ``OHHO_ARM_HARDWARE``, does not pass a force-disarm, and
+does not accept a non-loopback ``px4+dds://`` URI.
+
+Nothing in this module imports Ohho at import time, so the mission rules can
+be tested without ROS or the simulator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+import urllib.parse
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Optional, Sequence
+
+# Plan section 3. These are the pass/fail numbers, not tuning guesses.
+TAKEOFF_ALT_M = 2.5
+ALT_TOLERANCE_M = 0.4
+ALT_HOLD_S = 2.0
+SQUARE_SIDE_M = 4.0
+CORNER_TOLERANCE_M = 0.8
+CRUISE_SPEED_MPS = 0.5
+STREAM_HZ = 10.0
+STATUS_TIMEOUT_S = 120.0
+TAKEOFF_TIMEOUT_S = 90.0
+CORNER_TIMEOUT_S = 30.0
+LAND_TIMEOUT_S = 90.0
+MISSION_DEADLINE_S = 600.0
+# Same floor the Ohho disarm gate uses. A higher reading must not be disarmed.
+DISARM_ALTITUDE_M = 0.25
+# Same battery floor SafetyGate.takeoff uses.
+TAKEOFF_MIN_BATTERY = 0.3
+DEFAULT_URI = "px4+dds://127.0.0.1:8888"
+YAW_NED = 0.0
+
+CRITERIA: dict[str, float] = {
+    "takeoff_alt_m": TAKEOFF_ALT_M,
+    "alt_tolerance_m": ALT_TOLERANCE_M,
+    "alt_hold_s": ALT_HOLD_S,
+    "square_side_m": SQUARE_SIDE_M,
+    "corner_tolerance_m": CORNER_TOLERANCE_M,
+    "cruise_speed_mps": CRUISE_SPEED_MPS,
+    "stream_hz": STREAM_HZ,
+    "status_timeout_s": STATUS_TIMEOUT_S,
+}
+
+
+class MissionError(RuntimeError):
+    """The mission cannot continue. The process exits non-zero."""
+
+
+@dataclass(frozen=True)
+class DroneSample:
+    """One aerial snapshot the mission loop can judge without Ohho types."""
+
+    x: Optional[float]
+    y: Optional[float]
+    z: Optional[float]
+    pose_frame: Optional[str]
+    armed: Optional[bool]
+    landed_state: str
+    failsafe: tuple[str, ...]
+    link_ok: bool
+    battery: Optional[float]
+    prearm: Optional[bool]
+
+
+@dataclass
+class MissionResult:
+    """Pass/fail record written as JSON for the CI artifact."""
+
+    passed: bool
+    reasons: list[str]
+    duration_s: float
+    phases: list[str]
+    corner_errors_m: list[Optional[float]]
+    failsafes: list[str]
+    landed_state: Optional[str]
+    armed: Optional[bool]
+    takeoff_held: bool
+
+    def to_json(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["criteria"] = dict(CRITERIA)
+        return payload
+
+
+def square_corners(
+    side_m: float = SQUARE_SIDE_M, z_ned: float = -TAKEOFF_ALT_M
+) -> tuple[tuple[float, float, float], ...]:
+    """Local NED corners of a closed square, including the return to the origin.
+
+    x is north, y is east, z is down. Altitude is ``-z``.
+    """
+    side = float(side_m)
+    down = float(z_ned)
+    return (
+        (0.0, 0.0, down),
+        (side, 0.0, down),
+        (side, side, down),
+        (0.0, side, down),
+        (0.0, 0.0, down),
+    )
+
+
+def scored_corners(
+    side_m: float = SQUARE_SIDE_M, z_ned: float = -TAKEOFF_ALT_M
+) -> tuple[tuple[float, float, float], ...]:
+    """The four corners that must be reached, in flight order.
+
+    The opening origin is the takeoff hold. It is scored only when the path
+    returns there.
+    """
+    return square_corners(side_m, z_ned)[1:]
+
+
+def cruise_points(
+    side_m: float = SQUARE_SIDE_M,
+    speed_mps: float = CRUISE_SPEED_MPS,
+    hz: float = STREAM_HZ,
+    z_ned: float = -TAKEOFF_ALT_M,
+) -> tuple[tuple[float, float, float], ...]:
+    """Position setpoints that walk the square at ``speed_mps``.
+
+    Consecutive points are ``speed_mps / hz`` metres apart, and every scored
+    corner is included exactly once.
+    """
+    if speed_mps <= 0.0 or hz <= 0.0 or side_m <= 0.0:
+        raise ValueError("side, speed, and stream rate must be positive")
+    step = speed_mps / hz
+    corners = square_corners(side_m, z_ned)
+    points: list[tuple[float, float, float]] = [corners[0]]
+    for start, end in zip(corners, corners[1:]):
+        dist = math.hypot(end[0] - start[0], end[1] - start[1])
+        count = max(1, math.ceil(dist / step - 1e-12))
+        for index in range(1, count + 1):
+            fraction = index / count
+            points.append(
+                (
+                    start[0] + (end[0] - start[0]) * fraction,
+                    start[1] + (end[1] - start[1]) * fraction,
+                    z_ned,
+                )
+            )
+    return tuple(points)
+
+
+def horizontal_error_m(
+    x: Optional[float], y: Optional[float], corner: tuple[float, float, float]
+) -> Optional[float]:
+    """Horizontal distance in metres, or None when the pose is incomplete."""
+    if x is None or y is None:
+        return None
+    if not math.isfinite(x) or not math.isfinite(y):
+        return None
+    return math.hypot(x - corner[0], y - corner[1])
+
+
+def altitude_error_m(z_ned: Optional[float], target_up_m: float = TAKEOFF_ALT_M) -> Optional[float]:
+    """``|z_ned + target|`` for a NED down-positive altitude. None if z is missing."""
+    if z_ned is None or not math.isfinite(z_ned):
+        return None
+    return abs(z_ned + target_up_m)
+
+
+def positive_up_m(sample: DroneSample) -> Optional[float]:
+    """Metres above the local origin. Only LOCAL_NED is converted.
+
+    Missing z, a non-finite z, or any other frame stays None so a disarm is
+    not authorised from an unknown height.
+    """
+    if sample.pose_frame != "LOCAL_NED" or sample.z is None:
+        return None
+    if not math.isfinite(sample.z):
+        return None
+    return -sample.z
+
+
+def corner_accepted(sample: DroneSample, corner: tuple[float, float, float]) -> bool:
+    """True when the vehicle is inside the corner box at the held altitude."""
+    horizontal = horizontal_error_m(sample.x, sample.y, corner)
+    vertical = altitude_error_m(sample.z)
+    if horizontal is None or vertical is None:
+        return False
+    return horizontal <= CORNER_TOLERANCE_M and vertical < ALT_TOLERANCE_M
+
+
+def altitude_held(z_ned: Optional[float], since: Optional[float], now: float) -> tuple[bool, Optional[float]]:
+    """Return whether ``z_ned`` has stayed inside the band for ``ALT_HOLD_S``.
+
+    The second value is the new start of the continuous hold, or None when the
+    band was left.
+    """
+    error = altitude_error_m(z_ned)
+    if error is None or error >= ALT_TOLERANCE_M:
+        return False, None
+    start = now if since is None else since
+    return (now - start) >= ALT_HOLD_S, start
+
+
+def hardware_arming_block(requires_hardware_arming: bool) -> Optional[str]:
+    """Why a loopback flight must stop, or None when the gate treats it as sim.
+
+    The hardware path needs ``OHHO_ARM_HARDWARE``. This script never sets that
+    variable, so a gate that still classifies the sim target as hardware cannot
+    be armed from here.
+    """
+    if not requires_hardware_arming:
+        return None
+    return (
+        "SafetyGate.requires_hardware_arming is true for this loopback "
+        "px4+dds target. Refusing to set OHHO_ARM_HARDWARE."
+    )
+
+
+def refuse_hardware_arm_env(environ: dict[str, str]) -> None:
+    """Stop if a caller already enabled the hardware-arming switch."""
+    if environ.get("OHHO_ARM_HARDWARE") == "1":
+        raise MissionError(
+            "OHHO_ARM_HARDWARE is set. This SITL script does not run with "
+            "hardware arming enabled."
+        )
+
+
+def _loopback_host(host: str) -> bool:
+    name = host.strip().lower()
+    if name in {"localhost", "::1"}:
+        return True
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    parts = name.split(".")
+    if len(parts) != 4:
+        return False
+    numbers: list[int] = []
+    for part in parts:
+        if not part.isdigit():
+            return False
+        number = int(part)
+        if number > 255:
+            return False
+        numbers.append(number)
+    return numbers[0] == 127
+
+
+def check_sitl_uri(uri: str) -> None:
+    """Accept only a loopback ``px4+dds://`` URI with no credentials."""
+    try:
+        parsed = urllib.parse.urlparse(uri)
+    except ValueError as exc:
+        raise MissionError(f"invalid px4+dds URI: {exc}") from exc
+    if parsed.scheme != "px4+dds":
+        raise MissionError(
+            f"URI scheme {parsed.scheme!r} is not px4+dds. This script only "
+            "flies a loopback PX4 SITL."
+        )
+    if parsed.username or parsed.password:
+        raise MissionError("px4+dds URI does not take credentials")
+    host = parsed.hostname
+    if not host or not _loopback_host(host):
+        raise MissionError(
+            "refusing a non-loopback px4+dds host. This script does not fly hardware."
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise MissionError(f"invalid px4+dds port: {exc}") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise MissionError("px4+dds port must be in 1..65535")
+
+
+def _same_point(
+    left: tuple[float, float, float], right: tuple[float, float, float]
+) -> bool:
+    return all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(left, right))
+
+
+def _blank_result(reasons: Sequence[str], duration_s: float = 0.0) -> MissionResult:
+    return MissionResult(
+        passed=False,
+        reasons=list(reasons),
+        duration_s=duration_s,
+        phases=[],
+        corner_errors_m=[],
+        failsafes=[],
+        landed_state=None,
+        armed=None,
+        takeoff_held=False,
+    )
+
+
+class _Mission:
+    """One flight. ``sleep`` must advance ``clock`` or the loop stops."""
+
+    def __init__(
+        self,
+        vehicle: Any,
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+        log: Callable[[str], None],
+        deadline_s: float,
+    ) -> None:
+        self.vehicle = vehicle
+        self.clock = clock
+        self.sleep = sleep
+        self.log = log
+        self.started = clock()
+        self.deadline_s = deadline_s
+        self.phases: list[str] = []
+        self.reasons: list[str] = []
+        self.failsafes: list[str] = []
+        self._record_failsafe = False
+        self.sample = DroneSample(
+            None, None, None, None, None, "unknown", (), False, None, None
+        )
+        self.hold_since: Optional[float] = None
+        self.takeoff_held = False
+        self.corner_errors: list[Optional[float]] = []
+        self._took_off = False
+        self._asked_disarm = False
+
+    def phase(self, name: str) -> None:
+        self.phases.append(name)
+        self.log(f"phase {name}")
+
+    def _note_sample(self, sample: DroneSample) -> None:
+        self.sample = sample
+        if self._record_failsafe:
+            for flag in sample.failsafe:
+                if flag not in self.failsafes:
+                    self.failsafes.append(flag)
+                    self.log(f"failsafe flag after takeoff: {flag}")
+
+    def _advance(self, period_s: float) -> None:
+        before = self.clock()
+        self.sleep(period_s)
+        if self.clock() <= before:
+            raise MissionError("sleep did not advance the mission clock")
+        if self.clock() - self.started > self.deadline_s:
+            self.reasons.append("mission deadline exceeded")
+
+    def _timed_out(self, start: float, timeout_s: float) -> bool:
+        return self.clock() - start >= timeout_s or bool(self.reasons)
+
+    def read(self) -> DroneSample:
+        sample = self.vehicle.snapshot()
+        self._note_sample(sample)
+        return sample
+
+    def wait_until(
+        self,
+        ready: Callable[[], bool],
+        timeout_s: float,
+        *,
+        period_s: Optional[float] = None,
+        while_waiting: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        period = (1.0 / STREAM_HZ) if period_s is None else period_s
+        start = self.clock()
+        while True:
+            self.read()
+            if while_waiting is not None:
+                while_waiting()
+            if self.reasons:
+                return False
+            if ready():
+                return True
+            if self._timed_out(start, timeout_s):
+                return False
+            self._advance(period)
+            if self.reasons:
+                return False
+
+    def call(self, label: str, fn: Callable[[], None]) -> bool:
+        try:
+            fn()
+        except MissionError as exc:
+            self.reasons.append(f"{label}: {exc}")
+            return False
+        if self.vehicle.latched():
+            reason = self.vehicle.latch_reason()
+            self.reasons.append(f"safety gate latched during {label}: {reason}")
+            return False
+        return True
+
+    def finish(self) -> MissionResult:
+        if self._took_off and not self.vehicle.latched():
+            self.phase("land")
+            self.call("land", self.vehicle.land)
+            self._wait_landed()
+        reasons = list(self.reasons)
+        if self._record_failsafe and self.failsafes:
+            reasons.append(
+                "failsafe after takeoff: " + ", ".join(self.failsafes)
+            )
+        if self._took_off and not self.takeoff_held:
+            if not any("takeoff" in reason for reason in reasons):
+                reasons.append(
+                    f"takeoff altitude was not inside {ALT_TOLERANCE_M} m "
+                    f"for {ALT_HOLD_S} s"
+                )
+        expected = len(scored_corners())
+        if "square" in self.phases and len(self.corner_errors) < expected:
+            reasons.append(
+                f"reached {len(self.corner_errors)} of {expected} square corners"
+            )
+        for index, error in enumerate(self.corner_errors):
+            if error is None or error > CORNER_TOLERANCE_M:
+                reasons.append(
+                    f"corner {index + 1} horizontal error {error} m "
+                    f"exceeds {CORNER_TOLERANCE_M} m"
+                )
+        if self._took_off:
+            if self.sample.landed_state != "on_ground":
+                reasons.append(
+                    f"landed_state is {self.sample.landed_state!r}, not on_ground"
+                )
+            if self.sample.armed is not False:
+                reasons.append("motors were not disarmed at the end")
+        # A gate latch or an early refusal is already in reasons. De-duplicate
+        # while keeping order.
+        unique: list[str] = []
+        for reason in reasons:
+            if reason not in unique:
+                unique.append(reason)
+        passed = self._took_off and not unique
+        return MissionResult(
+            passed=passed,
+            reasons=unique,
+            duration_s=self.clock() - self.started,
+            phases=list(self.phases),
+            corner_errors_m=list(self.corner_errors),
+            failsafes=list(self.failsafes),
+            landed_state=self.sample.landed_state,
+            armed=self.sample.armed,
+            takeoff_held=self.takeoff_held,
+        )
+
+    def _wait_landed(self) -> None:
+        def ready() -> bool:
+            sample = self.sample
+            if sample.landed_state != "on_ground":
+                return False
+            if sample.armed is False:
+                return True
+            altitude = positive_up_m(sample)
+            if altitude is None or altitude > DISARM_ALTITUDE_M:
+                return False
+            # One normal disarm. The gate refuses this unless the vehicle is
+            # on the ground and low. There is no force flag.
+            if not self._asked_disarm:
+                self._asked_disarm = True
+                self.call("disarm", self.vehicle.disarm_flight)
+            return self.sample.armed is False
+
+        if not self.wait_until(ready, LAND_TIMEOUT_S):
+            if not any("landed_state" in reason or "disarm" in reason for reason in self.reasons):
+                self.reasons.append("landing did not end disarmed on the ground")
+
+    def run(self) -> MissionResult:
+        try:
+            self.phase("wait-status")
+            if not self.wait_until(
+                lambda: _ready_to_arm(self.sample), STATUS_TIMEOUT_S
+            ):
+                self.reasons.append(_not_ready_reason(self.sample))
+                return self.finish()
+
+            self.phase("arm-gate")
+            armed = False
+            try:
+                armed = bool(self.vehicle.arm_gate())
+            except MissionError as exc:
+                self.reasons.append(f"arm gate: {exc}")
+                return self.finish()
+            if not armed:
+                detail = self.vehicle.last_error()
+                extra = f" ({detail})" if detail else ""
+                self.reasons.append(f"SafetyGate.arm() refused the gate{extra}")
+                return self.finish()
+
+            # The gate's arm_flight requires an offboard setpoint younger than
+            # its command timeout. Publish once and arm before that window
+            # closes. Do not sleep between the two calls.
+            self.phase("arm-flight")
+            if not self.call(
+                "arm setpoint",
+                lambda: self.vehicle.offboard_position(0.0, 0.0, 0.0, YAW_NED),
+            ):
+                return self.finish()
+            if not self.call("arm_flight", self.vehicle.arm_flight):
+                return self.finish()
+
+            self.phase("takeoff")
+            if not self.call("takeoff", lambda: self.vehicle.takeoff(TAKEOFF_ALT_M)):
+                return self.finish()
+            self._took_off = True
+
+            def held() -> bool:
+                ok, since = altitude_held(
+                    self.sample.z, self.hold_since, self.clock()
+                )
+                self.hold_since = since
+                return ok
+
+            # Position setpoints are not streamed here. A setpoint would switch
+            # PX4 out of NAV_TAKEOFF and back into offboard.
+            if not self.wait_until(held, TAKEOFF_TIMEOUT_S):
+                self.reasons.append(
+                    f"|z_ned + {TAKEOFF_ALT_M}| did not stay under "
+                    f"{ALT_TOLERANCE_M} m for {ALT_HOLD_S} s"
+                )
+                return self.finish()
+            self.takeoff_held = True
+            self._record_failsafe = True
+            self._note_sample(self.sample)
+
+            self.phase("square")
+            self._fly_square()
+            return self.finish()
+        except MissionError as exc:
+            self.reasons.append(str(exc))
+            return self.finish()
+
+    def _fly_square(self) -> None:
+        scored = scored_corners()
+        next_corner = 0
+        period = 1.0 / STREAM_HZ
+        for point in cruise_points():
+            if self.reasons:
+                return
+            def publish(
+                target: tuple[float, float, float] = point,
+            ) -> None:
+                self.vehicle.offboard_position(
+                    target[0], target[1], target[2], YAW_NED
+                )
+
+            if not self.call("offboard_position", publish):
+                return
+            self._advance(period)
+            self.read()
+            if next_corner < len(scored) and _same_point(point, scored[next_corner]):
+                if not self._hold_corner(scored[next_corner], next_corner):
+                    return
+                next_corner += 1
+        if next_corner != len(scored) and not self.reasons:
+            self.reasons.append(
+                f"path ended after {next_corner} of {len(scored)} corners"
+            )
+
+    def _hold_corner(self, corner: tuple[float, float, float], index: int) -> bool:
+        def at_corner() -> bool:
+            return corner_accepted(self.sample, corner)
+
+        def republish() -> None:
+            self.call(
+                "corner setpoint",
+                lambda: self.vehicle.offboard_position(
+                    corner[0], corner[1], corner[2], YAW_NED
+                ),
+            )
+
+        ok = self.wait_until(
+            at_corner, CORNER_TIMEOUT_S, while_waiting=republish
+        )
+        error = horizontal_error_m(self.sample.x, self.sample.y, corner)
+        self.corner_errors.append(error)
+        self.log(
+            f"corner {index + 1} horizontal_error_m={error} accepted={ok}"
+        )
+        if not ok and not self.reasons:
+            self.reasons.append(
+                f"corner {index + 1} was not inside {CORNER_TOLERANCE_M} m "
+                f"horizontal and {ALT_TOLERANCE_M} m vertical"
+            )
+        return ok
+
+
+def _ready_to_arm(sample: DroneSample) -> bool:
+    if not sample.link_ok:
+        return False
+    if sample.battery is None or sample.battery < TAKEOFF_MIN_BATTERY:
+        return False
+    if sample.prearm is False:
+        return False
+    return True
+
+
+def _not_ready_reason(sample: DroneSample) -> str:
+    if not sample.link_ok:
+        return f"vehicle_status was not visible within {STATUS_TIMEOUT_S:.0f} s"
+    if sample.battery is None or sample.battery < TAKEOFF_MIN_BATTERY:
+        return f"battery fraction {sample.battery} is below {TAKEOFF_MIN_BATTERY}"
+    if sample.prearm is False:
+        return "PX4 pre-arm checks did not pass"
+    return "simulator was not ready to arm"
+
+
+def run_mission(
+    vehicle: Any,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Callable[[str], None] = print,
+    deadline_s: float = MISSION_DEADLINE_S,
+) -> MissionResult:
+    """Fly the square on ``vehicle`` and return the pass/fail record.
+
+    ``vehicle`` supplies ``snapshot``, ``arm_gate``, ``arm_flight``, ``takeoff``,
+    ``offboard_position``, ``land``, ``disarm_flight``, ``latched``,
+    ``latch_reason``, and ``last_error``. Flight methods raise
+    :class:`MissionError` when the gate refuses them.
+    """
+    return _Mission(vehicle, clock, sleep, log, deadline_s).run()
+
+
+class OhhoVehicle:
+    """``Robot`` plus the aerial SafetyGate, shaped for :func:`run_mission`."""
+
+    def __init__(self, robot: Any) -> None:
+        self.robot = robot
+
+    def snapshot(self) -> DroneSample:
+        tele = self.robot.telemetry()
+        custom = tele.custom if isinstance(getattr(tele, "custom", None), dict) else {}
+        drone = custom.get("drone")
+        if not isinstance(drone, dict):
+            drone = {}
+        pose = drone.get("pose")
+        if not isinstance(pose, dict):
+            pose = {}
+        flags = drone.get("failsafe")
+        if not isinstance(flags, (list, tuple)):
+            flags = ()
+        frame = drone.get("pose_frame")
+        return DroneSample(
+            x=_finite(pose.get("x")),
+            y=_finite(pose.get("y")),
+            z=_finite(pose.get("z")),
+            pose_frame=frame if isinstance(frame, str) else None,
+            armed=_optional_bool(drone.get("armed")),
+            landed_state=_landed(drone.get("landed_state")),
+            failsafe=tuple(str(flag) for flag in flags),
+            link_ok=drone.get("link_ok") is True,
+            battery=_battery(tele, drone),
+            prearm=_prearm(self.robot),
+        )
+
+    def arm_gate(self) -> bool:
+        return bool(self.robot.arm())
+
+    def arm_flight(self) -> None:
+        self._flight("arm_flight", lambda: self.robot.arm_flight())
+
+    def takeoff(self, alt_m: float) -> None:
+        self._flight("takeoff", lambda: self.robot.takeoff(alt_m))
+
+    def offboard_position(self, x: float, y: float, z: float, yaw: float) -> None:
+        from ohho.aerial import Frame
+
+        self._flight(
+            "offboard_position",
+            lambda: self.robot.offboard_position(x, y, z, yaw, Frame.LOCAL_NED),
+        )
+
+    def land(self) -> None:
+        self._flight("land", lambda: self.robot.land())
+
+    def disarm_flight(self) -> None:
+        self._flight("disarm_flight", lambda: self.robot.disarm_flight())
+
+    def latched(self) -> bool:
+        gate = self.robot.transport
+        return bool(getattr(gate, "latched", False))
+
+    def latch_reason(self) -> Optional[str]:
+        gate = self.robot.transport
+        reason = getattr(gate, "latch_reason", None)
+        return None if reason is None else str(reason)
+
+    def last_error(self) -> Optional[str]:
+        gate = self.robot.transport
+        error = getattr(gate, "last_error", None)
+        return None if not error else str(error)
+
+    def _flight(self, label: str, fn: Callable[[], None]) -> None:
+        gate = self.robot.transport
+        if hasattr(gate, "last_error"):
+            gate.last_error = None
+        fn()
+        if bool(getattr(gate, "latched", False)):
+            raise MissionError(
+                f"{label} latched the safety gate ({getattr(gate, 'latch_reason', None)})"
+            )
+        error = getattr(gate, "last_error", None)
+        if error:
+            raise MissionError(f"{label} refused by SafetyGate: {error}")
+
+
+def _finite(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _landed(value: Any) -> str:
+    if value in {"on_ground", "in_air", "takeoff", "landing", "unknown"}:
+        return str(value)
+    return "unknown"
+
+
+def _battery(tele: Any, drone: dict[str, Any]) -> Optional[float]:
+    samples: list[float] = []
+    for value in (getattr(tele, "battery", None), drone.get("battery")):
+        number = _finite(value)
+        if number is not None:
+            samples.append(number)
+    if not samples:
+        return None
+    return min(samples)
+
+
+def _prearm(robot: Any) -> Optional[bool]:
+    """Read PX4's pre-arm flag when the transport has received vehicle_status.
+
+    Telemetry does not carry the flag. Arming without it latches the gate, so
+    the mission waits on the message the transport already stored.
+    """
+    gate = robot.transport
+    inner = getattr(gate, "_inner", gate)
+    status = getattr(inner, "_status_msg", None)
+    if status is None or not hasattr(status, "pre_flight_checks_pass"):
+        return None
+    return getattr(status, "pre_flight_checks_pass", False) is True
+
+
+def connect_and_run(
+    uri: str,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    log: Callable[[str], None] = print,
+) -> MissionResult:
+    """Connect ``px4-sitl`` through the aerial gate and fly the square."""
+    check_sitl_uri(uri)
+    try:
+        from ohho import capabilities as caps
+        from ohho.adapters.px4_dds import is_sim_target, parse_px4_dds_uri
+        from ohho.registry import RobotSpec, UnknownRobot, get_spec, register
+        from ohho.robot import connect
+        from ohho.safety import profile_for
+    except ImportError as exc:
+        raise MissionError(
+            "ohho-os is not importable. Install "
+            "git+https://github.com/ohho-robotics/ohho-os.git@ohh-290-px4-dds."
+        ) from exc
+
+    host, port, _namespace = parse_px4_dds_uri(uri)
+    if not is_sim_target(host, port):
+        raise MissionError(
+            "ohho.adapters.px4_dds.is_sim_target refused this URI. "
+            "Refusing to connect."
+        )
+
+    try:
+        spec = get_spec("px4-sitl")
+    except UnknownRobot:
+        spec = register(
+            RobotSpec(
+                id="px4-sitl",
+                name="PX4 SITL",
+                category="aerial",
+                capabilities=(caps.AERIAL,),
+                adapter="px4+dds",
+                dof_base=0,
+                max_lin=2.0,
+                max_ang=0.8,
+            )
+        )
+    if not spec.has(caps.AERIAL):
+        raise MissionError("px4-sitl spec has no aerial capability")
+    planned = profile_for(spec.id, spec)
+    if not getattr(planned, "aerial", False):
+        raise MissionError(
+            "the safety profile for px4-sitl is not aerial. "
+            "The installed ohho-os does not include the OHH-288 drone profile."
+        )
+
+    robot = connect("px4-sitl", uri, runtime="ros2")
+    try:
+        if not getattr(robot, "gated", False):
+            raise MissionError("px4+dds connected without a SafetyGate")
+        gate = robot.transport
+        if not getattr(getattr(gate, "profile", None), "aerial", False):
+            raise MissionError("SafetyGate profile is not the aerial profile")
+        block = hardware_arming_block(
+            bool(getattr(gate, "requires_hardware_arming", False))
+        )
+        if block:
+            raise MissionError(block)
+        return run_mission(OhhoVehicle(robot), clock=clock, sleep=sleep, log=log)
+    finally:
+        try:
+            robot.disconnect()
+        except Exception as exc:
+            log(f"disconnect failed: {exc}")
+
+
+def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fly a 4 m square at 2.5 m on loopback PX4 SITL through Ohho. "
+            "There is no hardware-arm switch."
+        )
+    )
+    parser.add_argument("--uri", default=DEFAULT_URI, help=f"default {DEFAULT_URI}")
+    parser.add_argument(
+        "--result",
+        default="",
+        help="write the JSON pass/fail record to this path",
+    )
+    return parser.parse_args(list(argv))
+
+
+def _write_result(result: MissionResult, path: str) -> None:
+    payload = result.to_json()
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    print(text)
+    if not path:
+        return
+    from pathlib import Path
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text + "\n", encoding="utf-8")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    result: MissionResult
+    try:
+        refuse_hardware_arm_env(dict(os.environ))
+        check_sitl_uri(args.uri)
+        result = connect_and_run(args.uri)
+    except MissionError as exc:
+        result = _blank_result([str(exc)])
+        print(f"mission failed: {exc}", file=sys.stderr)
+    _write_result(result, args.result)
+    print(
+        f"passed={str(result.passed).lower()} "
+        f"duration_s={result.duration_s:.3f} "
+        f"phases={','.join(result.phases) or '-'}"
+    )
+    return 0 if result.passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

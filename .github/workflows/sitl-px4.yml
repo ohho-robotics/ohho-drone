@@ -1,0 +1,126 @@
+# PX4 v1.17.0 SITL square through Ohho (OHH-291).
+#
+# Docker Hub has no px4io/px4-sitl-gazebo:v1.17.0 or
+# px4io/px4-sitl-gazebo-ros2:v1.17.0 tag (checked 19 Oct 2026). The moving
+# ros2 tag is a v1.18 beta, which ohho-os refuses. This job pins
+# px4io/px4-dev:v1.17.0 by digest and builds gz_x500 from the v1.17.0 git tag.
+#
+# The plan's cold-start budget is 20 minutes for a prebuilt image. The hard
+# timeout is 40 minutes so a cold Gazebo install and PX4 compile can finish
+# and record a runtime against that budget. CI does not set OHHO_ARM_HARDWARE.
+
+name: sitl-px4
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/sitl-px4.yml"
+      - "scripts/sitl_square.py"
+      - "scripts/run_sitl_px4.sh"
+      - "tests/test_sitl_square.py"
+      - "docs/sitl-px4.md"
+
+permissions:
+  contents: read
+
+env:
+  PX4_IMAGE_REPO: px4io/px4-dev
+  PX4_IMAGE_TAG: v1.17.0
+  PX4_IMAGE_INDEX_DIGEST: sha256:288dc1d7f5290855e86dbaf8b8f55cd17f46f27e9df2affb2056df6363bc6fb0
+  PX4_IMAGE_AMD64_DIGEST: sha256:82e3ddcf4bf3fa4dbc0be6489c6de4158d0efbc8530182c691184302027335ce
+
+jobs:
+  criteria:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Mission criteria tests
+        run: python -m unittest discover -s tests -v
+      - name: Shell syntax
+        run: bash -n scripts/run_sitl_px4.sh
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  square:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse hardware arming
+        run: |
+          if [ "${OHHO_ARM_HARDWARE:-}" = "1" ]; then
+            echo "refusing to run: OHHO_ARM_HARDWARE is set" >&2
+            exit 1
+          fi
+
+      - name: Restore the pinned PX4 dev image
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/px4-dev-image.tar
+          key: px4io-px4-dev-${{ env.PX4_IMAGE_INDEX_DIGEST }}
+
+      - name: Load or pull the pinned image
+        run: |
+          set -euo pipefail
+          image="${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}"
+          if [ -f /tmp/px4-dev-image.tar ]; then
+            docker load -i /tmp/px4-dev-image.tar
+          else
+            docker pull "$image"
+            docker save "$image" -o /tmp/px4-dev-image.tar
+          fi
+          digests="$(docker image inspect "$image" --format '{{json .RepoDigests}}')"
+          echo "$digests"
+          case "$digests" in
+            *"${PX4_IMAGE_INDEX_DIGEST}"*|*"${PX4_IMAGE_AMD64_DIGEST}"*) ;;
+            *)
+              echo "refusing image: digest is not the pinned v1.17.0 image" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Fly the square
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          docker rm -f ohho-px4 >/dev/null 2>&1 || true
+          docker run -d --name ohho-px4 \
+            --entrypoint /bin/bash \
+            -e HEADLESS=1 \
+            -e PX4_SIM_MODEL=gz_x500 \
+            -e PX4_GZ_WORLD=default \
+            -e PX4_SIM_SPEED_FACTOR=1 \
+            -e LIBGL_ALWAYS_SOFTWARE=1 \
+            -e CI="${CI}" \
+            -e GITHUB_ACTIONS="${GITHUB_ACTIONS}" \
+            -v "$GITHUB_WORKSPACE:/opt/ohho-drone:ro" \
+            -v "$GITHUB_WORKSPACE/artifacts:/artifacts" \
+            "${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}" \
+            -lc 'sleep infinity'
+          docker exec ohho-px4 bash /opt/ohho-drone/scripts/run_sitl_px4.sh
+
+      - name: Keep the PX4 console tail
+        if: always()
+        run: |
+          mkdir -p artifacts
+          if [ -f artifacts/px4-console.log ]; then
+            tail -n 200 artifacts/px4-console.log > artifacts/px4-console-tail.txt
+          fi
+          docker rm -f ohho-px4 >/dev/null 2>&1 || true
+
+      - name: Upload logs and ulog
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: px4-sitl-logs
+          path: artifacts/
+          if-no-files-found: warn
