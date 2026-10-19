@@ -7,9 +7,12 @@ name: ArduPilot SITL square
 # speedup 1. It is not a measured runtime. The square-result artifact records
 # elapsed_s on the first run.
 #
-# Install pin: ohho-os branch ohh-305-mavlink-backend (draft PR #62).
-# Human TODO: after that branch merges, install ohho[mavlink] from main.
-# pip 25.1 rejects #egg=ohho[mavlink], so the step uses the name @ url form.
+# Install pin: ohho-os[mavlink] from branch ohh-305-mavlink-backend
+# (ohho-os draft PR #62). That branch's pyproject name is ohho-os and its
+# optional extra is mavlink. pip discards a requirement named ohho.
+# Human TODO: after that branch merges, install ohho-os[mavlink] from main.
+# pip 25.1 rejects a #egg= fragment that is not a plain project name, so
+# the step uses the name @ url form.
 
 on:
   workflow_dispatch:
@@ -71,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install "ohho[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend"
+          python -m pip install "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend"
 
       - name: Clone ArduPilot Copter-4.7.2
         run: |

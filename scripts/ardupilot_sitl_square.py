@@ -27,10 +27,12 @@ COPTER_TAG = "Copter-4.7.2"
 COPTER_COMMIT = "fb773567896014da007bca58358704d4a0d8516f"
 SITL_URI = "mavlink+udp://127.0.0.1:14540"
 MAVSDK_URL = "udpin://127.0.0.1:14540"
-# pip 25.1 rejects ``#egg=ohho[mavlink]`` (non-PEP-508 egg name). This is the
-# same branch pin: ohho[mavlink] from ohh-305-mavlink-backend.
+# Direct URL for branch ohh-305-mavlink-backend. That branch's project name
+# is ohho-os and the extra in its pyproject is mavlink. A requirement named
+# ohho does not match the built metadata, so pip discards the candidate.
+# pip 25.1 also rejects a #egg= fragment that is not a plain project name.
 OHHO_PIP_URL = (
-    "ohho[mavlink] @ git+https://github.com/ohho-robotics/ohho-os"
+    "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os"
     "@ohh-305-mavlink-backend"
 )
 ROBOT_ID = "px4-sitl"

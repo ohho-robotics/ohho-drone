@@ -8,11 +8,11 @@ The square in `.github/workflows/sitl-ardupilot.yml` was **not** flown while thi
 
 Ohho install in CI, until [ohho-os PR #62](https://github.com/ohho-robotics/ohho-os/pull/62) merges:
 
-`ohho[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend`
+`ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend`
 
-That is branch `ohh-305-mavlink-backend` with the `mavlink` extra. pip 25.1 rejects the older `#egg=ohho[mavlink]` spelling of the same URL.
+That is branch `ohh-305-mavlink-backend`. The project name on that branch is `ohho-os`, and the optional extra in its pyproject is `mavlink`. pip discards a requirement named `ohho` because the built metadata name is `ohho-os`. pip 25.1 also rejects a `#egg=` fragment that is not a plain project name, so CI uses the name @ url form.
 
-After that merge, install `ohho[mavlink]` from `main`. CI leaves `OHHO_ARM_HARDWARE` unset. The SITL URI is `mavlink+udp://127.0.0.1:14540` (`udpin://127.0.0.1:14540`).
+After that merge, install `ohho-os[mavlink]` from `main`. CI leaves `OHHO_ARM_HARDWARE` unset. The SITL URI is `mavlink+udp://127.0.0.1:14540` (`udpin://127.0.0.1:14540`).
 
 ## Square
 

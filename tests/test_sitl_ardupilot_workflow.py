@@ -43,6 +43,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(square.OHHO_PIP_URL, self.text)
         self.assertIn("--fly", self.text)
 
+    def test_install_requirement_matches_ohho_os_metadata(self) -> None:
+        expected = (
+            "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os"
+            "@ohh-305-mavlink-backend"
+        )
+        self.assertEqual(square.OHHO_PIP_URL, expected)
+        self.assertIn(f'python -m pip install "{expected}"', self.text)
+        self.assertNotIn("ohho[mavlink]", self.text)
+        self.assertNotIn("ohho[mavlink]", square.OHHO_PIP_URL)
+
     def test_does_not_set_hardware_arming_or_pass_arm(self) -> None:
         self.assertNotIn("OHHO_ARM_HARDWARE=", self.text)
         self.assertNotIn("--arm", self.text)

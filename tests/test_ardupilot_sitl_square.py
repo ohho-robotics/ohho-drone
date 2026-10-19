@@ -230,6 +230,8 @@ class CliTests(unittest.TestCase):
         self.assertIn(square.MAVSDK_URL, result.stdout)
         self.assertIn(square.COPTER_TAG, result.stdout)
         self.assertIn(square.OHHO_PIP_URL, result.stdout)
+        self.assertIn("ohho-os[mavlink] @ ", result.stdout)
+        self.assertNotIn("ohho[mavlink]", result.stdout)
         self.assertIn("2.5", result.stdout)
         self.assertIn("4", result.stdout)
         self.assertIn("0.8", result.stdout)

@@ -123,6 +123,12 @@ class DocTests(unittest.TestCase):
         self.assertIn("not** flown", self.text)
         self.assertIn("Copter-4.7.2", self.text)
         self.assertIn("fb773567896014da007bca58358704d4a0d8516f", self.text)
+        self.assertIn(
+            "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os"
+            "@ohh-305-mavlink-backend",
+            self.text,
+        )
+        self.assertNotIn("ohho[mavlink]", self.text)
 
 
 if __name__ == "__main__":
