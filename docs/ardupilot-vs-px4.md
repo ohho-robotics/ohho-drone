@@ -40,7 +40,7 @@ External setpoints are [ArduPilot GUIDED](https://ardupilot.org/copter/docs/ac2_
 | Land | LAND. Ohho `land()` is MAVSDK `land` | Land. Same Ohho call |
 | Return | [RTL](https://ardupilot.org/copter/docs/rtl-mode.html). Ohho `rtl()` is MAVSDK `return_to_launch` | Return. Same Ohho call |
 
-The aerial gate is armed before the autopilot. A ground-hold offboard stream at 10 Hz runs before and during `arm_flight`, because the gate refuses that arm without a setpoint in the last 300 ms. Takeoff is then MAVSDK `takeoff` (`MAV_CMD_NAV_TAKEOFF`). The carrot stream walks each side at 0.5 m/s, 10 Hz, in `LOCAL_NED` after the climb.
+The aerial gate is armed before the autopilot. A ground-hold offboard stream at 10 Hz runs before and during `arm_flight`, because the gate refuses that arm without a setpoint in the last 300 ms. That stream is MAVSDK offboard, which is Copter GUIDED. The autopilot arm counts only after the HEARTBEAT armed bit is visible; Copter's heartbeat is 1 Hz. Takeoff then stops the position stream and calls MAVSDK `takeoff` (`MAV_CMD_NAV_TAKEOFF`). MAVSDK enters GUIDED when the vehicle is not already in its Offboard mode, and the altitude is metres above home. A position target left running at z=0 would leave GUIDED's takeoff and the motors would stay in ground idle. The carrot stream walks each side at 0.5 m/s, 10 Hz, in `LOCAL_NED` after the climb.
 
 Offboard loss on PX4 waits [`COM_OF_LOSS_T`](https://docs.px4.io/v1.17/en/advanced_config/parameter_reference.html#COM_OF_LOSS_T) (default 1.0 s) and then does [`COM_OBL_RC_ACT`](https://docs.px4.io/v1.17/en/advanced_config/parameter_reference.html#COM_OBL_RC_ACT). Default 0 is Position mode. The value list also contains Terminate (6) and Disarm (7). Those two stay unused. Ohho keeps streaming at 10 Hz for the whole square so the timer does not expire.
 
@@ -113,7 +113,7 @@ Ohho leaves these at the firmware defaults. The square does not clear them to ma
 | Fence | `FENCE_ACTION` above | `GF_ACTION` above |
 | Offboard / GUIDED loss | GUIDED setpoints stop being renewed. RC loss still follows `FS_THR_ENABLE` unless `FS_OPTIONS` bit 2 is set. | `COM_OF_LOSS_T` then `COM_OBL_RC_ACT` |
 
-[`DISARM_DELAY`](https://ardupilot.org/copter/docs/parameters-Copter-stable-V4.7.0.html#disarm-delay-disarm-delay) is how long Copter waits after landing before it disarms itself. The square waits until `landed_state` is `on_ground` and positive-up height is at most 0.25 m, then sends one normal disarm if the motors are still armed.
+[`DISARM_DELAY`](https://ardupilot.org/copter/docs/parameters-Copter-stable-V4.7.0.html#disarm-delay-disarm-delay) is how long Copter waits, while landed with the motors in ground idle, before it disarms itself. The default is 10 s. A takeoff that never spools the motors hits that timer. The square waits until `landed_state` is `on_ground` and positive-up height is at most 0.25 m, then sends one normal disarm if the motors are still armed.
 
 ## E-stop
 

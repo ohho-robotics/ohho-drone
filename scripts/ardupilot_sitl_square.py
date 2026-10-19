@@ -95,6 +95,18 @@ ARM_TIMEOUT_S = 90.0
 ARM_ATTEMPTS = 3
 ARM_RETRY_PAUSE_S = 2.0
 ARM_READY_LOG_S = 5.0
+# Minimum post-arm stream. Not a phase timeout. Copter's HEARTBEAT is 1 Hz,
+# so this alone can still see a stale disarmed bit.
+ARM_SETTLE_S = 0.5
+# Keep polling the HEARTBEAT armed bit at least this long before a retry.
+ARM_CONFIRM_S = 3.0
+# Four corners, each with its own CORNER_TIMEOUT_S. The carrot between
+# corners is not inside that timer.
+SQUARE_CORNERS = 4
+# Added to the sum of the phase budgets. Does not replace any of them.
+WALL_MARGIN_S = 30.0
+# How long the wall-clock expiry waits for a land call that may itself be stuck.
+WALL_LAND_ATTEMPT_S = 5.0
 # Copter-4.7.2 leaves every SR0_* rate at 0 Hz. ``--no-mavproxy`` means nothing
 # else asks for streams. MAVSDK heartbeats then republish a default health
 # object, so ``is_armable`` stays false even after "EKF3 IMU0 is using GPS".
@@ -556,8 +568,13 @@ def recipe() -> str:
             f"at {STREAM_HZ:g} Hz, and arm the autopilot "
             "(MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0). "
             "The gate refuses that arm unless a setpoint was forwarded in the "
-            f"last 300 ms. A rejected arm is retried {ARM_ATTEMPTS} times.",
-            f"4. Take off to {TAKEOFF_ALT_M} m. Pass the climb when "
+            "last 300 ms. That stream starts MAVSDK offboard, which is Copter "
+            "GUIDED. The arm counts only after the HEARTBEAT armed bit is "
+            f"visible (polled for {ARM_CONFIRM_S:g} s; the heartbeat is 1 Hz). "
+            f"A rejected arm is retried {ARM_ATTEMPTS} times.",
+            f"4. Take off to {TAKEOFF_ALT_M} m above home. The ground-hold "
+            "position stream stops first, then MAVSDK takeoff enters GUIDED "
+            "and sends MAV_CMD_NAV_TAKEOFF. Pass the climb when "
             f"|z_ned + {TAKEOFF_ALT_M}| < {ALT_TOL_M} m for {ALT_HOLD_S:g} s.",
             f"5. Square, {SIDE_M:g} m sides, LOCAL_NED, carrot at {SPEED_MPS} m/s, "
             "altitude held, setpoints at "
@@ -640,6 +657,42 @@ def _hold_until(
     raise SquareFailed(on_fail if last is None else f"{on_fail}; last z={last.z}")
 
 
+def flight_wall_s(
+    *,
+    ground_timeout_s: float = GROUND_TIMEOUT_S,
+    arm_timeout_s: float = ARM_TIMEOUT_S,
+    arm_attempts: int = ARM_ATTEMPTS,
+    arm_retry_pause_s: float = ARM_RETRY_PAUSE_S,
+    arm_confirm_s: float = ARM_CONFIRM_S,
+    climb_timeout_s: float = CLIMB_TIMEOUT_S,
+    corner_timeout_s: float = CORNER_TIMEOUT_S,
+    land_timeout_s: float = LAND_TIMEOUT_S,
+    corners: int = SQUARE_CORNERS,
+) -> float:
+    """Sum of the time each phase is allowed to run, plus a small margin.
+
+    The corner timer applies once per corner. The carrot between corners is
+    outside that timer. Nothing here is shorter than the phase it covers.
+    """
+    carrot_s = corners * (SIDE_M / SPEED_MPS)
+    return (
+        ground_timeout_s
+        + arm_timeout_s
+        + arm_attempts * arm_confirm_s
+        + max(0, arm_attempts - 1) * arm_retry_pause_s
+        + climb_timeout_s
+        + corners * corner_timeout_s
+        + land_timeout_s
+        + carrot_s
+        + WALL_MARGIN_S
+    )
+
+
+def script_wall_s() -> float:
+    """``--fly`` budget, including autopilot discovery before the phases."""
+    return DISCOVERY_TIMEOUT_S + flight_wall_s()
+
+
 def fly_square(
     vehicle: object,
     *,
@@ -649,6 +702,8 @@ def fly_square(
     arm_timeout_s: float = ARM_TIMEOUT_S,
     arm_attempts: int = ARM_ATTEMPTS,
     arm_retry_pause_s: float = ARM_RETRY_PAUSE_S,
+    arm_settle_s: float = ARM_SETTLE_S,
+    arm_confirm_s: float = ARM_CONFIRM_S,
     climb_timeout_s: float = CLIMB_TIMEOUT_S,
     corner_timeout_s: float = CORNER_TIMEOUT_S,
     land_timeout_s: float = LAND_TIMEOUT_S,
@@ -669,6 +724,8 @@ def fly_square(
             arm_timeout_s=arm_timeout_s,
             arm_attempts=arm_attempts,
             arm_retry_pause_s=arm_retry_pause_s,
+            arm_settle_s=arm_settle_s,
+            arm_confirm_s=arm_confirm_s,
             climb_timeout_s=climb_timeout_s,
             corner_timeout_s=corner_timeout_s,
             land_timeout_s=land_timeout_s,
@@ -703,6 +760,8 @@ def _fly(
     arm_timeout_s: float,
     arm_attempts: int,
     arm_retry_pause_s: float,
+    arm_settle_s: float,
+    arm_confirm_s: float,
     climb_timeout_s: float,
     corner_timeout_s: float,
     land_timeout_s: float,
@@ -731,6 +790,8 @@ def _fly(
         vehicle,
         attempts=arm_attempts,
         pause_s=arm_retry_pause_s,
+        settle_s=arm_settle_s,
+        confirm_s=arm_confirm_s,
         sleep=sleep,
     )
 
@@ -911,11 +972,47 @@ def _stream_setpoints(
         remaining -= step
 
 
+def _confirm_armed(
+    vehicle: object,
+    *,
+    settle_s: float,
+    confirm_s: float,
+    sleep: Callable[[float], None],
+) -> VehicleSample:
+    """Stream a ground hold until the HEARTBEAT armed bit is set.
+
+    Copter sends HEARTBEAT at 1 Hz. ``subscribe_armed`` follows that bit, so
+    a single sample ``settle_s`` after the arm command can still read
+    disarmed. Keep the post-arm stream for at least ``settle_s`` and keep
+    polling until ``confirm_s``.
+    """
+    if confirm_s + 1e-9 < settle_s:
+        raise SquareFailed("arm confirm window is shorter than the settle stream")
+    sample = _stream_setpoints(vehicle, settle_s, sleep=sleep)
+    if sample.armed or confirm_s <= settle_s + 1e-9:
+        return sample
+    period = 1.0 / STREAM_HZ
+    remaining = confirm_s - settle_s
+    while remaining > 1e-9:
+        _raise_if_flags(sample)
+        if sample.armed:
+            return sample
+        step = period if remaining > period else remaining
+        sleep(step)
+        remaining -= step
+        sample = _read(vehicle)
+        x, y, z = _arm_hold_ned(sample)
+        _call(vehicle, "stream_setpoint", x, y, z, 0.0)
+    return sample
+
+
 def _arm_with_retries(
     vehicle: object,
     *,
     attempts: int,
     pause_s: float,
+    settle_s: float,
+    confirm_s: float,
     sleep: Callable[[float], None],
 ) -> VehicleSample:
     """Arm a vehicle that is already armable. A few rejections are retried.
@@ -923,12 +1020,11 @@ def _arm_with_retries(
     The aerial gate refuses ``arm_flight`` unless an offboard setpoint was
     forwarded in the last 300 ms. This publishes that stream at ``STREAM_HZ``
     immediately before every arm, and keeps publishing through the settle
-    window and the retry pause.
+    window and the retry pause. Takeoff waits until the HEARTBEAT armed bit
+    is set, not until a fixed 0.5 s sample happens to show it.
     """
     if attempts < 1:
         raise SquareFailed("arm attempts must be at least 1")
-    # Same post-arm pause the readiness fix used before reading ``armed``.
-    settle_s = 0.5
     last_error = "arm was not called"
     for attempt in range(1, attempts + 1):
         _stream_setpoints(vehicle, 0.0, sleep=sleep)
@@ -939,7 +1035,12 @@ def _arm_with_retries(
             last_error = str(exc)
             print(f"arm rejected: {last_error}", flush=True)
         else:
-            sample = _stream_setpoints(vehicle, settle_s, sleep=sleep)
+            sample = _confirm_armed(
+                vehicle,
+                settle_s=settle_s,
+                confirm_s=confirm_s,
+                sleep=sleep,
+            )
             _raise_if_flags(sample)
             if sample.armed:
                 return sample
@@ -1540,6 +1641,88 @@ def _failure_payload(exc: BaseException, elapsed_s: float) -> dict[str, object]:
     }
 
 
+class _FlightWall:
+    """End a hung ``--fly`` as a failed result instead of the job timeout.
+
+    The timer is real time. A blocked MAVSDK call does not advance the
+    flight's own phase clocks, so this does not live inside those loops.
+    Expiry attempts land, writes square-result.json, and exits even if that
+    land call is itself stuck.
+    """
+
+    def __init__(
+        self,
+        budget_s: float,
+        vehicle_box: list[object],
+        result_path: str,
+        started: float,
+        exit_fn: Callable[[int], None],
+        *,
+        land_attempt_s: float = WALL_LAND_ATTEMPT_S,
+    ) -> None:
+        self.budget_s = budget_s
+        self._vehicle_box = vehicle_box
+        self._result_path = result_path
+        self._started = started
+        self._exit_fn = exit_fn
+        self._land_attempt_s = land_attempt_s
+        self._lock = threading.Lock()
+        self._done = False
+        self._timer = threading.Timer(budget_s, self._fire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._done = True
+        self._timer.cancel()
+
+    def _fire(self) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+        message = (
+            f"square wall clock expired after {self.budget_s:g}s "
+            "before the flight returned"
+        )
+        print(message, file=sys.stderr, flush=True)
+        vehicle = self._vehicle_box[0]
+        if vehicle is not None:
+            _attempt_land(vehicle, self._land_attempt_s)
+        elapsed = time.perf_counter() - self._started
+        try:
+            _write_result(
+                self._result_path,
+                _failure_payload(SquareFailed(message), elapsed),
+            )
+        except Exception as write_exc:
+            print(
+                f"could not write {self._result_path}: {write_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._exit_fn(1)
+
+
+def _attempt_land(vehicle: object, attempt_s: float) -> None:
+    """Call ``land`` without waiting forever if that call is deadlocked."""
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            _call(vehicle, "land")
+        except Exception as exc:
+            print(f"land after wall clock failed: {exc}", file=sys.stderr, flush=True)
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="ohho-square-wall-land", daemon=True).start()
+    done.wait(attempt_s)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1571,18 +1754,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(recipe())
         return 0
     started = time.perf_counter()
+    vehicle_box: list[object] = [None]
+    wall = _FlightWall(script_wall_s(), vehicle_box, args.result, started, os._exit)
+    wall.start()
     vehicle: OhhoVehicle | None = None
     try:
         vehicle = open_sitl()
+        vehicle_box[0] = vehicle
         report = fly_square(vehicle)
+        wall.cancel()
         elapsed = time.perf_counter() - started
         _write_result(args.result, report.as_dict(elapsed_s=elapsed))
         print(f"elapsed_s={elapsed:.3f}", flush=True)
         return 0
     except Refused as exc:
+        wall.cancel()
         print(str(exc), file=sys.stderr)
         return 2
     except Exception as exc:
+        wall.cancel()
         elapsed = time.perf_counter() - started
         try:
             _write_result(args.result, _failure_payload(exc, elapsed))
@@ -1592,6 +1782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"elapsed_s={elapsed:.3f}", flush=True)
         return 1
     finally:
+        wall.cancel()
         if vehicle is not None:
             try:
                 vehicle.close()

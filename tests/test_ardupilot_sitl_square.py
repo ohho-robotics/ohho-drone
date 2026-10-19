@@ -8,6 +8,8 @@ import math
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -104,6 +106,42 @@ class FakeVehicle:
 
     def close(self) -> None:
         self.calls.append("close")
+
+
+class _HeartbeatLagVehicle(FakeVehicle):
+    """Arm command returns before the HEARTBEAT armed bit is visible."""
+
+    def __init__(self, lag_s: float) -> None:
+        super().__init__()
+        self.lag_s = lag_s
+        self._armed_at: float | None = None
+        self._latched = False
+        self.takeoff_at = 0.0
+
+    def arm(self) -> None:
+        self.calls.append("arm")
+        if self.clock is not None:
+            self.arm_at.append(self.clock.t)
+            self._armed_at = self.clock.t + self.lag_s
+        if self.arm_rejects > 0:
+            self.arm_rejects -= 1
+            raise RuntimeError("FAILED; origin: arm(); params: ()")
+
+    def read(self) -> square.VehicleSample:
+        if (
+            not self._latched
+            and self._armed_at is not None
+            and self.clock is not None
+            and self.clock.t + 1e-9 >= self._armed_at
+        ):
+            self.armed = True
+            self._latched = True
+        return super().read()
+
+    def takeoff(self, alt_m: float) -> None:
+        if self.clock is not None:
+            self.takeoff_at = self.clock.t
+        super().takeoff(alt_m)
 
 
 class Recorder:
@@ -486,6 +524,31 @@ class ArmReadinessTests(unittest.TestCase):
         self.assertIn("land", vehicle.calls)
         self.assertIn("after 3 attempts", str(caught))
         self.assertIn("arm rejected:", text)
+
+    def test_stale_heartbeat_armed_bit_is_not_an_arm_rejection(self) -> None:
+        """Copter HEARTBEAT is 1 Hz. A sample at 0.5 s can still read disarmed."""
+        vehicle = _HeartbeatLagVehicle(lag_s=1.0)
+        clock = FakeClock()
+        report, text, caught = self._fly(vehicle, clock)
+        self.assertIsNone(caught)
+        assert report is not None
+        self.assertTrue(report.passed)
+        self.assertEqual(vehicle.calls.count("arm"), 1)
+        self.assertNotIn("arm rejected:", text)
+        waited = vehicle.takeoff_at - vehicle.arm_at[0]
+        self.assertGreater(waited, square.ARM_SETTLE_S)
+        self.assertAlmostEqual(waited, 1.0, delta=1e-6)
+        self.assertLess(waited, square.ARM_CONFIRM_S)
+
+    def test_armed_bit_that_never_arrives_is_still_rejected(self) -> None:
+        vehicle = _HeartbeatLagVehicle(lag_s=square.ARM_CONFIRM_S + 5.0)
+        clock = FakeClock()
+        _report, text, caught = self._fly(vehicle, clock, arm_attempts=1)
+        assert caught is not None
+        self.assertIn("stayed disarmed", str(caught))
+        self.assertIn("arm rejected:", text)
+        self.assertNotIn("takeoff", vehicle.calls)
+        self.assertEqual(vehicle.calls.count("arm"), 1)
 
     def test_link_and_airborne_state_block_arm(self) -> None:
         sample = square.VehicleSample(
@@ -876,6 +939,97 @@ class GateFlightTests(unittest.TestCase):
             vehicle.arm_gate()
         self.assertIn("SafetyGate.arm() refused the gate", str(caught.exception))
         self.assertIn("ci", str(caught.exception))
+
+
+class WallClockTests(unittest.TestCase):
+    def test_budget_is_the_phase_sum_plus_a_margin(self) -> None:
+        self.assertEqual(square.GROUND_TIMEOUT_S, 90.0)
+        self.assertEqual(square.ARM_TIMEOUT_S, 90.0)
+        self.assertEqual(square.CLIMB_TIMEOUT_S, 90.0)
+        self.assertEqual(square.CORNER_TIMEOUT_S, 45.0)
+        self.assertEqual(square.LAND_TIMEOUT_S, 60.0)
+        self.assertEqual(square.DISCOVERY_TIMEOUT_S, 120.0)
+        self.assertEqual(square.ARM_SETTLE_S, 0.5)
+        self.assertGreaterEqual(square.ARM_CONFIRM_S, 2.0)
+        self.assertGreater(square.WALL_MARGIN_S, 0.0)
+        self.assertLess(square.WALL_MARGIN_S, 60.0)
+        self.assertGreater(square.WALL_LAND_ATTEMPT_S, 0.0)
+        self.assertLess(square.WALL_LAND_ATTEMPT_S, square.LAND_TIMEOUT_S)
+        corners = square.SQUARE_CORNERS
+        phases = (
+            square.GROUND_TIMEOUT_S
+            + square.ARM_TIMEOUT_S
+            + square.ARM_ATTEMPTS * square.ARM_CONFIRM_S
+            + (square.ARM_ATTEMPTS - 1) * square.ARM_RETRY_PAUSE_S
+            + square.CLIMB_TIMEOUT_S
+            + corners * square.CORNER_TIMEOUT_S
+            + square.LAND_TIMEOUT_S
+            + corners * (square.SIDE_M / square.SPEED_MPS)
+        )
+        self.assertAlmostEqual(square.flight_wall_s(), phases + square.WALL_MARGIN_S)
+        self.assertAlmostEqual(
+            square.script_wall_s(),
+            square.DISCOVERY_TIMEOUT_S + square.flight_wall_s(),
+        )
+
+    def test_expiry_attempts_land_and_writes_a_failure(self) -> None:
+        vehicle = FakeVehicle()
+        box: list[object] = [vehicle]
+        exited: dict[str, int] = {}
+
+        def exit_fn(code: int) -> None:
+            exited["code"] = code
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "square-result.json")
+            wall = square._FlightWall(
+                0.05,
+                box,
+                path,
+                time.perf_counter(),
+                exit_fn,
+                land_attempt_s=0.2,
+            )
+            wall.start()
+            wall._timer.join(2.0)
+            self.assertFalse(wall._timer.is_alive())
+            self.assertEqual(exited.get("code"), 1)
+            self.assertIn("land", vehicle.calls)
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertFalse(payload["passed"])
+            self.assertIn("wall clock expired", payload["message"])
+            self.assertIn("0.05", payload["message"])
+
+    def test_expiry_still_writes_when_land_blocks(self) -> None:
+        vehicle = FakeVehicle()
+        started = threading.Event()
+
+        def land() -> None:
+            vehicle.calls.append("land")
+            started.set()
+            threading.Event().wait()
+
+        vehicle.land = land  # type: ignore[method-assign]
+        box: list[object] = [vehicle]
+        exited: dict[str, int] = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "square-result.json")
+            wall = square._FlightWall(
+                0.05,
+                box,
+                path,
+                time.perf_counter(),
+                lambda code: exited.__setitem__("code", code),
+                land_attempt_s=0.15,
+            )
+            wall.start()
+            wall._timer.join(2.0)
+            self.assertFalse(wall._timer.is_alive())
+            self.assertTrue(started.is_set())
+            self.assertEqual(exited.get("code"), 1)
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertIn("wall clock expired", payload["message"])
+            self.assertFalse(payload["passed"])
 
 
 class CliTests(unittest.TestCase):
