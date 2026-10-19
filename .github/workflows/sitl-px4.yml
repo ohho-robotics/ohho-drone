@@ -8,6 +8,10 @@
 # The plan's cold-start budget is 20 minutes for a prebuilt image. The hard
 # timeout is 40 minutes so a cold Gazebo install and PX4 compile can finish
 # and record a runtime against that budget. CI does not set OHHO_ARM_HARDWARE.
+#
+# Headless SITL has no ground station. scripts/sitl_gcs_heartbeat.py sends a
+# MAVLink HEARTBEAT (MAV_TYPE_GCS) at the stock GCS port so PX4's pre-arm
+# check can pass. This workflow does not change PX4 failsafe parameters.
 
 name: sitl-px4
 
@@ -18,7 +22,8 @@ on:
       - ".github/workflows/sitl-px4.yml"
       - "scripts/sitl_square.py"
       - "scripts/run_sitl_px4.sh"
-      - "scripts/relay_px4_topics.py"
+      - "scripts/sitl_gcs_heartbeat.py"
+      - "requirements-sitl.txt"
       - "tests/test_sitl_square.py"
       - "docs/sitl-px4.md"
 
@@ -41,7 +46,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Mission criteria tests
-        run: python -m unittest discover -s tests -v
+        run: |
+          python -m pip install -r requirements-sitl.txt
+          python -m unittest discover -s tests -v
       - name: Shell syntax
         run: bash -n scripts/run_sitl_px4.sh
       - name: actionlint

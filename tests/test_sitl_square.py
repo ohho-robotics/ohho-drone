@@ -12,7 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import relay_px4_topics  # noqa: E402
+import sitl_gcs_heartbeat  # noqa: E402
 import sitl_square  # noqa: E402
 
 
@@ -281,6 +281,7 @@ class MissionTest(unittest.TestCase):
         takeoffs = [call for call in vehicle.calls if isinstance(call, tuple) and call[0] == "takeoff"]
         self.assertEqual(takeoffs, [("takeoff", 2.5)])
         self.assertIn("square", result.phases)
+        self.assertEqual(result.preflight_failures, [])
         self.assertEqual(result.to_json()["criteria"]["square_side_m"], 4.0)
 
     def test_gate_arm_refusal_does_not_take_off(self) -> None:
@@ -322,6 +323,127 @@ class MissionTest(unittest.TestCase):
         self.assertEqual(vehicle.disarm_landed, [])
         self.assertNotEqual(result.landed_state, "on_ground")
 
+    def test_wait_status_timeout_names_current_preflight_failures(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.prearm = False
+
+        def report() -> tuple[list[str], str]:
+            return ["No connection to the GCS"], ""
+
+        clock = Clock()
+
+        def sleep(dt: float) -> None:
+            clock.advance(dt)
+
+        result = sitl_square.run_mission(
+            vehicle,
+            clock=clock,
+            sleep=sleep,
+            log=lambda _line: None,
+            preflight_report=report,
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.phases, ["wait-status"])
+        self.assertEqual(result.preflight_failures, ["No connection to the GCS"])
+        self.assertTrue(
+            any(
+                "PX4 pre-arm checks did not pass: No connection to the GCS" in reason
+                for reason in result.reasons
+            )
+        )
+        self.assertNotIn("arm_gate", result.phases)
+
+    def test_missing_console_is_named_when_prearm_does_not_pass(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.prearm = False
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.preflight_failures, [])
+        self.assertTrue(
+            any("PX4 console log was not available" in reason for reason in result.reasons)
+        )
+
+    def test_arm_flight_ci_gate_is_named_and_does_not_take_off(self) -> None:
+        vehicle = FakeVehicle()
+
+        def arm_flight() -> None:
+            vehicle.calls.append("arm_flight")
+            raise sitl_square.MissionError(sitl_square.flight_refusal("arm_flight", "ci"))
+
+        vehicle.arm_flight = arm_flight  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("_human_tty_reason" in reason for reason in result.reasons))
+        self.assertTrue(any("_aerial_privileged" in reason for reason in result.reasons))
+        self.assertIn("arm-flight", result.phases)
+        self.assertNotIn("takeoff", result.phases)
+        self.assertNotIn("takeoff", _names(vehicle))
+
+
+class PreflightReportTest(unittest.TestCase):
+    def test_tail_keeps_checks_that_are_still_printing(self) -> None:
+        early = "WARN  [health_and_arming_checks] Preflight Fail: ekf2 missing data\n"
+        current = "WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS\n"
+        text = early + (current * sitl_square.PREFLIGHT_TAIL_LINES)
+        self.assertEqual(
+            sitl_square.preflight_failures(text),
+            ["No connection to the GCS"],
+        )
+
+    def test_several_current_checks_stay_in_order(self) -> None:
+        gcs = "WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS\t\n"
+        power = "WARN  [health_and_arming_checks] Preflight Fail: system power unavailable\n"
+        self.assertEqual(
+            sitl_square.preflight_failures((gcs + power) * 40),
+            ["No connection to the GCS", "system power unavailable"],
+        )
+
+    def test_console_file_uses_the_same_tail(self) -> None:
+        import tempfile
+
+        early = "WARN  [health_and_arming_checks] Preflight Fail: ekf2 missing data\n"
+        current = "WARN  [health_and_arming_checks] Preflight Fail: No connection to the GCS\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "px4-console.log"
+            path.write_text(early + current * 120, encoding="utf-8")
+            failures, note = sitl_square.read_preflight_failures(str(path))
+        self.assertEqual(failures, ["No connection to the GCS"])
+        self.assertEqual(note, "")
+        missing, missing_note = sitl_square.read_preflight_failures(
+            str(Path(tmp) / "absent.log")
+        )
+        self.assertEqual(missing, [])
+        self.assertIn("not available", missing_note)
+
+    def test_tty_gate_text_is_only_for_the_human_reasons(self) -> None:
+        ci = sitl_square.flight_refusal("arm_flight", "ci")
+        self.assertIn("_human_tty_reason", ci)
+        self.assertIn("_aerial_privileged", ci)
+        self.assertIn("(ci)", ci)
+        self.assertNotIn("OHHO_ARM_HARDWARE=1", ci)
+        other = sitl_square.flight_refusal("takeoff", "battery")
+        self.assertEqual(other, "takeoff refused by SafetyGate: battery")
+
+    def test_ohho_vehicle_maps_the_ci_gate_without_taking_off(self) -> None:
+        class Gate:
+            def __init__(self) -> None:
+                self.latched = False
+                self.latch_reason = None
+                self.last_error: str | None = None
+
+        class Robot:
+            def __init__(self) -> None:
+                self.transport = Gate()
+
+            def arm_flight(self) -> None:
+                self.transport.last_error = "ci"
+
+        vehicle = sitl_square.OhhoVehicle(Robot())
+        with self.assertRaises(sitl_square.MissionError) as caught:
+            vehicle.arm_flight()
+        self.assertIn("_human_tty_reason", str(caught.exception))
+        self.assertIn("(ci)", str(caught.exception))
+
 
 class WorkflowFileTest(unittest.TestCase):
     def test_workflow_pins_v1_17_and_keeps_the_hardware_switch_off(self) -> None:
@@ -341,7 +463,9 @@ class WorkflowFileTest(unittest.TestCase):
             "actions/upload-artifact@v4",
             "if: always()",
             "px4-console-tail.txt",
-            "scripts/relay_px4_topics.py",
+            "scripts/sitl_gcs_heartbeat.py",
+            "requirements-sitl.txt",
+            "python -m pip install -r requirements-sitl.txt",
             "tail -c 262144 artifacts/px4-console.log | tail -n 200 > artifacts/px4-console-tail.txt",
             "GITHUB_ACTIONS",
             'sudo chown -R "$(id -u):$(id -g)" artifacts',
@@ -392,12 +516,27 @@ class WorkflowFileTest(unittest.TestCase):
             "Startup script returned successfully",
             "tail -c 262144",
             "write_console_tail",
-            "scripts/relay_px4_topics.py",
+            "scripts/sitl_gcs_heartbeat.py",
+            "requirements-sitl.txt",
+            "127.0.0.1:14550 -> PX4 GCS port 18570",
+            "--px4-console",
+            'kill "$GCS_PID"',
         ):
             self.assertIn(required, script, required)
         self.assertNotIn("make px4_sitl gz_x500", script)
+        self.assertNotIn("relay_px4_topics", script)
+        self.assertNotIn("topic-relay", script)
+        self.assertNotIn("NAV_DLL_ACT", script)
+        self.assertNotIn("param set", script)
+        self.assertNotIn("relay_px4_topics", text)
+        self.assertNotIn("NAV_DLL_ACT", text)
+        self.assertFalse((ROOT / "scripts" / "relay_px4_topics.py").exists())
         self.assertLess(
-            script.index("scripts/relay_px4_topics.py"),
+            script.index("scripts/sitl_gcs_heartbeat.py"),
+            script.index('bin/px4" -d'),
+        )
+        self.assertLess(
+            script.index("scripts/sitl_gcs_heartbeat.py"),
             script.index('scripts/sitl_square.py"'),
         )
         self.assertLess(
@@ -418,26 +557,73 @@ class WorkflowFileTest(unittest.TestCase):
         self.assertNotIn("--network host", script)
         self.assertNotIn("21196", script)
 
-    def test_relay_mirrors_only_versioned_telemetry(self) -> None:
-        pairs = {(source, dest) for _name, source, dest in relay_px4_topics.RELAYS}
-        self.assertEqual(
-            pairs,
-            {
-                ("/fmu/out/vehicle_status_v1", "/fmu/out/vehicle_status"),
-                (
-                    "/fmu/out/vehicle_local_position_v1",
-                    "/fmu/out/vehicle_local_position",
-                ),
-                ("/fmu/out/battery_status_v1", "/fmu/out/battery_status"),
-            },
-        )
-        source = Path(relay_px4_topics.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("/fmu/in/", source)
-        self.assertNotIn("vehicle_command", source)
-        self.assertNotIn("OHHO_ARM_HARDWARE", source)
-        self.assertNotIn("--arm", source)
-        self.assertIn("TRANSIENT_LOCAL", source)
-        self.assertIn("BEST_EFFORT", source)
+    def test_gcs_heartbeat_is_one_loopback_heartbeat_and_does_not_command(self) -> None:
+        import socket
+
+        from pymavlink.dialects.v20 import common as mavlink2
+
+        pin = (ROOT / "requirements-sitl.txt").read_text(encoding="utf-8")
+        import pymavlink
+
+        self.assertIn(f"pymavlink=={pymavlink.__version__}", pin)
+        self.assertEqual(sitl_gcs_heartbeat.PX4_GCS_PORT, 18570)
+        self.assertEqual(sitl_gcs_heartbeat.GCS_BIND_PORT, 14550)
+        self.assertEqual(sitl_gcs_heartbeat.check_pymavlink_pin(), pymavlink.__version__)
+        sitl_gcs_heartbeat.require_instance_zero({})
+        sitl_gcs_heartbeat.require_instance_zero({"PX4_INSTANCE": "0"})
+        with self.assertRaises(sitl_gcs_heartbeat.GcsHeartbeatError):
+            sitl_gcs_heartbeat.require_instance_zero({"PX4_INSTANCE": "1"})
+        with mock.patch.dict(os.environ, {"PX4_INSTANCE": "1"}):
+            self.assertEqual(sitl_gcs_heartbeat.main([]), 1)
+
+        packet = sitl_gcs_heartbeat.gcs_heartbeat_bytes()
+        self.assertEqual(packet[0], 0xFD)
+        decoded = sitl_gcs_heartbeat.decode_packets(packet)
+        self.assertEqual([message.get_type() for message in decoded], ["HEARTBEAT"])
+        self.assertEqual(decoded[0].type, mavlink2.MAV_TYPE_GCS)
+        self.assertEqual(decoded[0].autopilot, mavlink2.MAV_AUTOPILOT_INVALID)
+        self.assertEqual(decoded[0].get_srcSystem(), sitl_gcs_heartbeat.GCS_SYSTEM_ID)
+
+        px4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        gcs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            px4.bind(("127.0.0.1", 0))
+            gcs.bind(("127.0.0.1", 0))
+            px4_port = px4.getsockname()[1]
+            gcs_port = gcs.getsockname()[1]
+        finally:
+            gcs.close()
+        px4.settimeout(2)
+        try:
+            sent = sitl_gcs_heartbeat.serve(
+                px4_port,
+                gcs_port,
+                max_heartbeats=1,
+                log=lambda _line: None,
+            )
+            self.assertEqual(sent, 1)
+            data, addr = px4.recvfrom(2048)
+        finally:
+            px4.close()
+        self.assertEqual(addr[0], "127.0.0.1")
+        self.assertEqual(addr[1], gcs_port)
+        live = sitl_gcs_heartbeat.decode_packets(data)
+        self.assertEqual([message.get_type() for message in live], ["HEARTBEAT"])
+        self.assertEqual(live[0].type, mavlink2.MAV_TYPE_GCS)
+
+        source = Path(sitl_gcs_heartbeat.__file__).read_text(encoding="utf-8")
+        for banned in (
+            "COMMAND_LONG",
+            "ARM_DISARM",
+            "param set",
+            "param_set",
+            "OHHO_ARM_HARDWARE",
+            "--arm",
+            "vehicle_command",
+        ):
+            self.assertNotIn(banned, source, banned)
+        self.assertIn("MAV_TYPE_GCS", source)
+        self.assertIn(sitl_gcs_heartbeat.LOOPBACK, source)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,8 @@ records the runtime on its first GitHub Actions run.
 | Agent | Micro XRCE-DDS Agent `v2.4.3`, `udp4 -p 8888` |
 | Messages | `px4_msgs` branch `release/1.17` |
 | ROS | Jazzy, installed in the container |
-| Ohho | `git+https://github.com/ohho-robotics/ohho-os.git@ohh-290-px4-dds` |
+| Ohho | `git+https://github.com/ohho-robotics/ohho-os.git@ohh-290-px4-dds` (`5acb80e`) |
+| GCS heartbeat | pymavlink `2.4.50`, bind `127.0.0.1:14550`, send to PX4 port `18570` |
 
 `px4io/px4-sitl-gazebo:v1.17.0` and `px4io/px4-sitl-gazebo-ros2:v1.17.0` were
 not on Docker Hub on 19 October 2026. `px4io/px4-sitl-gazebo-ros2:latest` is
@@ -51,16 +52,40 @@ The plan's budget for a prebuilt image is 20 minutes cold and 8 minutes warm.
 The workflow's hard timeout is 40 minutes so the first compile can finish and
 be compared with that budget. The image cache key is the index digest above.
 
+## Simulated GCS
+
+PX4 v1.17 `RcAndDataLinkChecks` blocks arming while `gcs_connection_lost` is
+set and `NAV_DLL_ACT` is greater than 0. Commander starts with that flag
+set. It clears the flag only after a MAVLink link reports a `MAV_TYPE_GCS`
+heartbeat (`heartbeat_type_gcs`). The receiver drops that report 2.5 s after
+the last heartbeat. The console line is `Preflight Fail: No connection to
+the GCS`.
+
+SITL instance 0 starts the GCS link as `mavlink start -x -u 18570`
+(`ROMFS/px4fmu_common/init.d-posix/px4-rc.mavlink`). `-o` is omitted, so the
+remote port stays the mavlink default 14550, and `init_udp` sends to
+`127.0.0.1`. `scripts/sitl_gcs_heartbeat.py` binds `127.0.0.1:14550` and
+sends only that heartbeat to `127.0.0.1:18570` once a second for the whole
+run. pymavlink is pinned in `requirements-sitl.txt` (`pymavlink==2.4.50`).
+
+The heartbeat does not arm, does not send any other MAVLink message, and
+does not change `NAV_DLL_ACT`, `COM_DL_LOSS_T`, or any other PX4 parameter.
+This repository has no vehicle parameter file. The stock data-link check
+stays in force. `PX4_INSTANCE` other than 0 is refused; this harness runs
+instance 0.
+
 ## Pass / fail
 
 The job fails unless all of these are true:
 
-- `/fmu/out/vehicle_status` shows up within 120 s. PX4 v1.17 publishes
-  that message on `/fmu/out/vehicle_status_v1` (`MESSAGE_VERSION` 1). The
-  same suffix is on `vehicle_local_position` and `battery_status`.
-  `scripts/relay_px4_topics.py` copies those three topics onto the
-  unversioned names `ohh-290-px4-dds` subscribes to, with best-effort
-  transient-local QoS. It does not publish `/fmu/in/*`.
+- Within 120 s, `/fmu/out/vehicle_status_v1` is visible, the battery
+  fraction is at least 0.3, and `pre_flight_checks_pass` is true. PX4 v1.17
+  publishes `vehicle_status`, `vehicle_local_position`, and `battery_status`
+  with `MESSAGE_VERSION` 1. ohho-os `ohh-290-px4-dds` at `5acb80e` subscribes
+  to those versioned names, so this recipe does not run a topic relay.
+- If that wait times out, `sitl-result.json` lists the `Preflight Fail:`
+  lines from the last 100 lines of the last 256 KiB of the PX4 console.
+  Checks that have stopped printing are not reported.
 - After takeoff, `|z_ned + 2.5| < 0.4` m for 2 s.
 - The square has 4 m sides in local NED, flown at 0.5 m/s with altitude held.
   Each corner is accepted only when the horizontal error is within 0.8 m and
@@ -88,19 +113,23 @@ container, so the recipe does not use host networking or `--privileged`.
 GitHub Actions forwards `CI` and `GITHUB_ACTIONS` into the container. The gate
 sees that this is CI.
 
-On the public `ohh-290-px4-dds` branch checked on 19 October 2026
-(`053b149`), `px4-sitl` uses the aerial profile, and
-`requires_hardware_arming` is false when the transport's `sim_target` is true.
-`arm()` on that sim target does not ask for the hardware phrase. `arm_flight`
-and `takeoff` still call the human-TTY check, which returns `ci` when `CI` or
-`GITHUB_ACTIONS` is set, before it looks at the sim flag. A headless runner
-also has no TTY. The script stops when the gate does that. It does not clear
-`CI`, allocate a fake TTY, set `OHHO_ARM_HARDWARE`, or call `send_flight` on
-the inner transport.
+On the public `ohh-290-px4-dds` branch at `5acb80e`, `px4-sitl` uses the
+aerial profile, and `requires_hardware_arming` is false when the transport's
+`sim_target` is true. `arm()` on that sim target does not ask for a human
+TTY. `arm_flight` and `takeoff` still call `_human_tty_reason` from
+`_aerial_privileged`, which returns `ci` when `CI` or `GITHUB_ACTIONS` is
+set, before it looks at the sim flag. A headless runner also has no TTY
+(`no_tty`).
 
-Switch the Ohho install from `ohh-290-px4-dds` to `main` once that branch has
-merged. The square can pass only after the gate allows `arm_flight` and
-`takeoff` for this loopback target from a headless CI job.
+When that happens the mission stops before takeoff. `sitl-result.json`
+`reasons` names `_human_tty_reason`, `_aerial_privileged`, and the gate
+reason (`ci` or `no_tty`). The script does not clear `CI`, allocate a fake
+TTY, set `OHHO_ARM_HARDWARE`, or call `send_flight` on the inner transport.
+
+That gate is a decision for the Ohho maintainers. This recipe does not
+bypass it. Switch the Ohho install from `ohh-290-px4-dds` to `main` once
+that branch has merged. The square can pass only after the gate allows
+`arm_flight` and `takeoff` for this loopback target from a headless CI job.
 
 ## Local recipe
 
@@ -138,7 +167,8 @@ models submodule, builds `px4_sitl_default`, starts `MicroXRCEAgent udp4 -p
 `-d` is daemon mode, so the `pxh` shell does not run. The `gz_x500` cmake
 target launches the same binary without `-d`; that shell reads stdin, and a
 redirect from `/dev/null` makes it print `pxh> ` until the log is huge.
-The Ohho process is `scripts/sitl_square.py`, after the topic relay.
+The Ohho process is `scripts/sitl_square.py`. The simulated GCS heartbeat
+is started before PX4 and left running until the container script exits.
 
 Mission rules without a simulator:
 
@@ -156,8 +186,9 @@ files.
 - `px4-console.log` and `px4-console-tail.txt` (last 200 lines of the last
   256 KiB, so a newline-free prompt cannot copy the whole console)
 - `xrce-agent.log`
-- `topic-relay.log`
-- `sitl-result.json` (criteria, phases, corner errors, failsafes, duration)
+- `gcs-heartbeat.log`
+- `sitl-result.json` (criteria, phases, corner errors, failsafes, duration,
+  and `preflight_failures` when the status wait times out)
 - any `*.ulg` logs the PX4 build wrote
 
 `duration_s` in `sitl-result.json` is only the mission clock after

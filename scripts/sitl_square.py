@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -51,6 +52,13 @@ CRITERIA: dict[str, float] = {
     "stream_hz": STREAM_HZ,
     "status_timeout_s": STATUS_TIMEOUT_S,
 }
+# Current preflight lines only. Cleared checks stop printing, so the tail of
+# the console is the set that is still failing when wait-status times out.
+PREFLIGHT_TAIL_LINES = 100
+PREFLIGHT_TAIL_BYTES = 262144
+_PREFLIGHT_FAIL = re.compile(r"Preflight Fail:\s*(.+)")
+# SafetyGate._human_tty_reason. ci is CI/GITHUB_ACTIONS; no_tty is headless.
+HUMAN_TTY_REASONS = frozenset({"ci", "no_tty"})
 
 
 class MissionError(RuntimeError):
@@ -86,6 +94,7 @@ class MissionResult:
     landed_state: Optional[str]
     armed: Optional[bool]
     takeoff_held: bool
+    preflight_failures: list[str]
 
     def to_json(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -206,6 +215,67 @@ def altitude_held(z_ned: Optional[float], since: Optional[float], now: float) ->
     return (now - start) >= ALT_HOLD_S, start
 
 
+def flight_refusal(label: str, error: str) -> str:
+    """How a SafetyGate flight refusal is written into the result.
+
+    ``ci`` and ``no_tty`` come from ``_human_tty_reason`` inside
+    ``_aerial_privileged``. The mission stops there. It does not pretend a
+    human is present.
+    """
+    if error in HUMAN_TTY_REASONS:
+        return (
+            f"{label} refused by SafetyGate ({error}): ohho-os "
+            "_human_tty_reason / _aerial_privileged blocks arm_flight and "
+            "takeoff when CI or GITHUB_ACTIONS is set, and when stdin is not "
+            "a TTY. This script does not allocate a fake TTY, clear CI, or "
+            "set OHHO_ARM_HARDWARE."
+        )
+    return f"{label} refused by SafetyGate: {error}"
+
+
+def preflight_failures(
+    console_text: str, *, tail_lines: int = PREFLIGHT_TAIL_LINES
+) -> list[str]:
+    """Distinct ``Preflight Fail:`` texts in the last ``tail_lines`` lines.
+
+    PX4 repeats a check that is still failing and stops once it passes. The
+    tail is that current set. A tab that mavlink_log appends is stripped.
+    """
+    found: list[str] = []
+    for line in console_text.splitlines()[-tail_lines:]:
+        match = _PREFLIGHT_FAIL.search(line)
+        if match is None:
+            continue
+        text = match.group(1).strip().rstrip("\t").strip()
+        if text and text not in found:
+            found.append(text)
+    return found
+
+
+def read_preflight_failures(path: str) -> tuple[list[str], str]:
+    """Failures from a PX4 console file, plus a note when there are none.
+
+    The note is empty when at least one current failure was found. Only the
+    last 256 KiB is read, the same bound as the console tail artifact.
+    """
+    if not path:
+        return [], "PX4 console log was not available"
+    from pathlib import Path
+
+    file = Path(path)
+    if not file.is_file():
+        return [], f"PX4 console log was not available ({path})"
+    try:
+        data = file.read_bytes()
+    except OSError as exc:
+        return [], f"PX4 console log could not be read ({exc})"
+    text = data[-PREFLIGHT_TAIL_BYTES:].decode("utf-8", errors="replace")
+    failures = preflight_failures(text)
+    if not failures:
+        return [], "PX4 console tail had no Preflight Fail lines"
+    return failures, ""
+
+
 def hardware_arming_block(requires_hardware_arming: bool) -> Optional[str]:
     """Why a loopback flight must stop, or None when the gate treats it as sim.
 
@@ -293,6 +363,7 @@ def _blank_result(reasons: Sequence[str], duration_s: float = 0.0) -> MissionRes
         landed_state=None,
         armed=None,
         takeoff_held=False,
+        preflight_failures=[],
     )
 
 
@@ -306,11 +377,13 @@ class _Mission:
         sleep: Callable[[float], None],
         log: Callable[[str], None],
         deadline_s: float,
+        preflight_report: Optional[Callable[[], tuple[list[str], str]]] = None,
     ) -> None:
         self.vehicle = vehicle
         self.clock = clock
         self.sleep = sleep
         self.log = log
+        self.preflight_report = preflight_report
         self.started = clock()
         self.deadline_s = deadline_s
         self.phases: list[str] = []
@@ -323,6 +396,7 @@ class _Mission:
         self.hold_since: Optional[float] = None
         self.takeoff_held = False
         self.corner_errors: list[Optional[float]] = []
+        self.preflight_failures: list[str] = []
         self._took_off = False
         self._asked_disarm = False
 
@@ -382,7 +456,10 @@ class _Mission:
         try:
             fn()
         except MissionError as exc:
-            self.reasons.append(f"{label}: {exc}")
+            text = str(exc)
+            reason = text if text.startswith(label) else f"{label}: {text}"
+            self.reasons.append(reason)
+            self.log(reason)
             return False
         if self.vehicle.latched():
             reason = self.vehicle.latch_reason()
@@ -441,6 +518,7 @@ class _Mission:
             landed_state=self.sample.landed_state,
             armed=self.sample.armed,
             takeoff_held=self.takeoff_held,
+            preflight_failures=list(self.preflight_failures),
         )
 
     def _wait_landed(self) -> None:
@@ -470,7 +548,11 @@ class _Mission:
             if not self.wait_until(
                 lambda: _ready_to_arm(self.sample), STATUS_TIMEOUT_S
             ):
-                self.reasons.append(_not_ready_reason(self.sample))
+                failures, note = self._collect_preflight()
+                self.preflight_failures = failures
+                reason = _not_ready_reason(self.sample, failures, note)
+                self.reasons.append(reason)
+                self.log(reason)
                 return self.finish()
 
             self.phase("arm-gate")
@@ -583,6 +665,19 @@ class _Mission:
             )
         return ok
 
+    def _collect_preflight(self) -> tuple[list[str], str]:
+        if self.preflight_report is None:
+            return [], "PX4 console log was not available"
+        try:
+            failures, note = self.preflight_report()
+        except OSError as exc:
+            return [], f"PX4 console log could not be read ({exc})"
+        if not isinstance(failures, list) or not all(
+            isinstance(item, str) for item in failures
+        ):
+            return [], "PX4 console report was unusable"
+        return list(failures), note if isinstance(note, str) else ""
+
 
 def _ready_to_arm(sample: DroneSample) -> bool:
     if not sample.link_ok:
@@ -594,14 +689,22 @@ def _ready_to_arm(sample: DroneSample) -> bool:
     return True
 
 
-def _not_ready_reason(sample: DroneSample) -> str:
+def _not_ready_reason(
+    sample: DroneSample, failures: Sequence[str], console_note: str
+) -> str:
     if not sample.link_ok:
-        return f"vehicle_status was not visible within {STATUS_TIMEOUT_S:.0f} s"
-    if sample.battery is None or sample.battery < TAKEOFF_MIN_BATTERY:
-        return f"battery fraction {sample.battery} is below {TAKEOFF_MIN_BATTERY}"
-    if sample.prearm is False:
-        return "PX4 pre-arm checks did not pass"
-    return "simulator was not ready to arm"
+        reason = f"vehicle_status was not visible within {STATUS_TIMEOUT_S:.0f} s"
+    elif sample.battery is None or sample.battery < TAKEOFF_MIN_BATTERY:
+        reason = f"battery fraction {sample.battery} is below {TAKEOFF_MIN_BATTERY}"
+    elif sample.prearm is False:
+        reason = "PX4 pre-arm checks did not pass"
+    else:
+        reason = "simulator was not ready to arm"
+    if failures:
+        return reason + ": " + "; ".join(failures)
+    if console_note:
+        return f"{reason} ({console_note})"
+    return reason
 
 
 def run_mission(
@@ -611,6 +714,7 @@ def run_mission(
     sleep: Callable[[float], None] = time.sleep,
     log: Callable[[str], None] = print,
     deadline_s: float = MISSION_DEADLINE_S,
+    preflight_report: Optional[Callable[[], tuple[list[str], str]]] = None,
 ) -> MissionResult:
     """Fly the square on ``vehicle`` and return the pass/fail record.
 
@@ -619,7 +723,9 @@ def run_mission(
     ``latch_reason``, and ``last_error``. Flight methods raise
     :class:`MissionError` when the gate refuses them.
     """
-    return _Mission(vehicle, clock, sleep, log, deadline_s).run()
+    return _Mission(
+        vehicle, clock, sleep, log, deadline_s, preflight_report
+    ).run()
 
 
 class OhhoVehicle:
@@ -702,7 +808,7 @@ class OhhoVehicle:
             )
         error = getattr(gate, "last_error", None)
         if error:
-            raise MissionError(f"{label} refused by SafetyGate: {error}")
+            raise MissionError(flight_refusal(label, str(error)))
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -757,6 +863,7 @@ def connect_and_run(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     log: Callable[[str], None] = print,
+    console_path: str = "",
 ) -> MissionResult:
     """Connect ``px4-sitl`` through the aerial gate and fly the square."""
     check_sitl_uri(uri)
@@ -815,7 +922,13 @@ def connect_and_run(
         )
         if block:
             raise MissionError(block)
-        return run_mission(OhhoVehicle(robot), clock=clock, sleep=sleep, log=log)
+        return run_mission(
+            OhhoVehicle(robot),
+            clock=clock,
+            sleep=sleep,
+            log=log,
+            preflight_report=lambda: read_preflight_failures(console_path),
+        )
     finally:
         try:
             robot.disconnect()
@@ -835,6 +948,11 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--result",
         default="",
         help="write the JSON pass/fail record to this path",
+    )
+    parser.add_argument(
+        "--px4-console",
+        default=os.environ.get("OHHO_PX4_CONSOLE", "/artifacts/px4-console.log"),
+        help="PX4 console log, read if wait-status times out",
     )
     return parser.parse_args(list(argv))
 
@@ -858,7 +976,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         refuse_hardware_arm_env(dict(os.environ))
         check_sitl_uri(args.uri)
-        result = connect_and_run(args.uri)
+        result = connect_and_run(args.uri, console_path=args.px4_console)
     except MissionError as exc:
         result = _blank_result([str(exc)])
         print(f"mission failed: {exc}", file=sys.stderr)

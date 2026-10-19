@@ -215,9 +215,16 @@ install_ohho() {
   python3 -m pip install --break-system-packages "$OHHO_OS_URL"
 }
 
+install_sitl_python() {
+  # pymavlink is pinned in requirements-sitl.txt. The simulated GCS uses it
+  # and checks the installed version against that pin before it binds.
+  log "installing pinned pymavlink for the simulated GCS"
+  python3 -m pip install --break-system-packages -r "$REPO_DIR/requirements-sitl.txt"
+}
+
 AGENT_PID=""
 PX4_PID=""
-RELAY_PID=""
+GCS_PID=""
 
 # GNU tail -n copies an entire line. The pxh prompt is "pxh> " with no newline,
 # so an unbounded tail -n reproduced the whole console (run 39300774890, 1.1 GB).
@@ -241,9 +248,9 @@ copy_logs() {
     kill "$AGENT_PID" 2>/dev/null
     wait "$AGENT_PID" 2>/dev/null
   fi
-  if [ -n "$RELAY_PID" ]; then
-    kill "$RELAY_PID" 2>/dev/null
-    wait "$RELAY_PID" 2>/dev/null
+  if [ -n "$GCS_PID" ]; then
+    kill "$GCS_PID" 2>/dev/null
+    wait "$GCS_PID" 2>/dev/null
   fi
   mkdir -p "$ARTIFACT_DIR"
   write_console_tail "$ARTIFACT_DIR/px4-console.log" "$ARTIFACT_DIR/px4-console-tail.txt"
@@ -266,6 +273,7 @@ install_agent
 build_px4_msgs
 build_px4
 install_ohho
+install_sitl_python
 
 log "starting MicroXRCEAgent udp4 -p 8888"
 MicroXRCEAgent udp4 -p 8888 > "$ARTIFACT_DIR/xrce-agent.log" 2>&1 &
@@ -274,6 +282,16 @@ sleep 1
 if ! kill -0 "$AGENT_PID" 2>/dev/null; then
   echo "MicroXRCEAgent exited" >&2
   cat "$ARTIFACT_DIR/xrce-agent.log" >&2 || true
+  exit 1
+fi
+
+log "starting simulated GCS heartbeat (127.0.0.1:14550 -> PX4 GCS port 18570)"
+python3 "$REPO_DIR/scripts/sitl_gcs_heartbeat.py" > "$ARTIFACT_DIR/gcs-heartbeat.log" 2>&1 &
+GCS_PID=$!
+sleep 1
+if ! kill -0 "$GCS_PID" 2>/dev/null; then
+  echo "GCS heartbeat exited" >&2
+  cat "$ARTIFACT_DIR/gcs-heartbeat.log" >&2 || true
   exit 1
 fi
 
@@ -328,6 +346,12 @@ if [ "$ready" -ne 1 ]; then
   log "PX4 console did not report ready within 180s; the mission still waits for vehicle_status"
 fi
 
+if ! kill -0 "$GCS_PID" 2>/dev/null; then
+  echo "GCS heartbeat exited before the mission" >&2
+  cat "$ARTIFACT_DIR/gcs-heartbeat.log" >&2 || true
+  exit 1
+fi
+
 log "flying the square through Ohho"
 set +u
 # shellcheck disable=SC1091
@@ -335,15 +359,7 @@ source /opt/ros/jazzy/setup.bash
 # shellcheck disable=SC1091
 source "$PX4_WS/install/setup.bash"
 set -u
-log "relaying versioned PX4 topics onto the names Ohho subscribes to"
-python3 "$REPO_DIR/scripts/relay_px4_topics.py" > "$ARTIFACT_DIR/topic-relay.log" 2>&1 &
-RELAY_PID=$!
-sleep 1
-if ! kill -0 "$RELAY_PID" 2>/dev/null; then
-  echo "topic relay exited" >&2
-  cat "$ARTIFACT_DIR/topic-relay.log" >&2 || true
-  exit 1
-fi
 python3 "$REPO_DIR/scripts/sitl_square.py" \
   --uri px4+dds://127.0.0.1:8888 \
+  --px4-console "$ARTIFACT_DIR/px4-console.log" \
   --result "$ARTIFACT_DIR/sitl-result.json"
