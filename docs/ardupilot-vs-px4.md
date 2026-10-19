@@ -18,7 +18,7 @@ After that merge, install `ohho-os[mavlink]` from `main`. CI leaves `OHHO_ARM_HA
 
 Same criteria as D-07, through the Ohho MAVLink backend:
 
-1. Wait until MAVSDK health reports the copter armable (`is_armable`, global position, and home position), then arm. The wait is bounded at 90 s and prints each check that is still failing. A rejected arm is retried a few times. Copter arming checks stay at their defaults.
+1. Request `SYS_STATUS`, `EKF_STATUS_REPORT`, and `GPS_RAW_INT` on the open link. Copter's `SR0_*` rates are 0 Hz and this job starts `sim_vehicle.py` with `--no-mavproxy`, so nothing else asks for those streams. Wait until the `SYS_STATUS` pre-arm bit is present, enabled, and healthy, the `EKF_STATUS_REPORT` flags match an absolute-position ready-to-arm, and `GPS_RAW_INT.fix_type` is at least 3. The wait is bounded at 90 s and prints each check that is still failing. A rejected arm is retried a few times. Copter arming checks stay at their defaults.
 2. Climb to 2.5 m. Hold while `|z_ned + 2.5| < 0.4` m for 2 s.
 3. Fly a square of 4 m sides in `LOCAL_NED` at 0.5 m/s, altitude held. Each corner within 0.8 m horizontal.
 4. Land. Pass when `landed_state` is `on_ground`, the motors are disarmed with a normal disarm, and no failsafe flag was set after takeoff.

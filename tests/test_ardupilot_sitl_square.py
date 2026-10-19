@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ardupilot_sitl_square.py"
@@ -44,7 +46,7 @@ class FakeVehicle:
         self.calls: list[str] = []
         self.arm_at: list[float] = []
         self.arm_rejects = 0
-        self.readiness = square.arm_readiness_ok()
+        self.readiness = square.copter_readiness_ok()
         self.clock: FakeClock | None = None
 
     def read(self) -> square.VehicleSample:
@@ -220,43 +222,125 @@ class FlightTests(unittest.TestCase):
         self.assertEqual(robot.calls[5], ("disconnect",))
 
 
-def _not_armable() -> square.ArmReadiness:
-    return square.ArmReadiness(
-        reported=True,
-        is_armable=False,
-        is_global_position_ok=False,
-        is_home_position_ok=False,
-        is_local_position_ok=True,
-        is_accelerometer_calibration_ok=True,
-        is_gyrometer_calibration_ok=False,
-        is_magnetometer_calibration_ok=True,
+def _sys_status(*, present: bool, enabled: bool, healthy: bool) -> dict[str, int]:
+    bit = square.MAV_SYS_STATUS_PREARM_CHECK
+    return {
+        "onboard_control_sensors_present": bit if present else 0,
+        "onboard_control_sensors_enabled": bit if enabled else 0,
+        "onboard_control_sensors_health": bit if healthy else 0,
+    }
+
+
+def _not_armable() -> square.CopterReadiness:
+    """Messages have arrived, and every arm gate is still failing."""
+    state = square.apply_mavlink_message(
+        square.CopterReadiness(),
+        "SYS_STATUS",
+        _sys_status(present=True, enabled=True, healthy=False),
     )
+    state = square.apply_mavlink_message(
+        state,
+        "EKF_STATUS_REPORT",
+        {"flags": square.EKF_CONST_POS_MODE | square.EKF_UNINITIALIZED},
+    )
+    return square.apply_mavlink_message(state, "GPS_RAW_INT", {"fix_type": 1})
 
 
 class ArmReadinessTests(unittest.TestCase):
-    def test_detail_names_failed_checks_and_ready_ignores_calibration(self) -> None:
+    def test_blockers_name_prearm_ekf_and_gps(self) -> None:
         blocked = _not_armable()
         self.assertFalse(blocked.ready())
         self.assertEqual(
             blocked.blockers(),
-            ("is_armable", "global position", "home position"),
+            (
+                "prearm check",
+                "EKF attitude",
+                "EKF horizontal velocity",
+                "EKF vertical velocity",
+                "EKF relative horizontal position",
+                "EKF absolute horizontal position",
+                "EKF absolute vertical position",
+                "EKF predicted relative position",
+                "EKF predicted absolute position",
+                "EKF const position mode",
+                "EKF uninitialized",
+                "GPS fix 1",
+            ),
         )
-        self.assertIn("gyrometer calibration", blocked.detail())
-        self.assertNotIn("accelerometer calibration", blocked.detail())
-        ready = square.ArmReadiness(
-            reported=True,
-            is_armable=True,
-            is_global_position_ok=True,
-            is_home_position_ok=True,
-            is_magnetometer_calibration_ok=False,
-        )
+        ready = square.copter_readiness_ok()
         self.assertTrue(ready.ready())
         self.assertEqual(ready.blockers(), ())
-        self.assertEqual(ready.detail(), ("magnetometer calibration",))
+        self.assertIsNotNone(ready.gps_fix_type)
+        assert ready.gps_fix_type is not None
+        self.assertGreaterEqual(ready.gps_fix_type, 3)
         self.assertEqual(
-            square.ArmReadiness().blockers(),
-            ("mavsdk health not received",),
+            square.CopterReadiness().blockers(),
+            (
+                "SYS_STATUS not received",
+                "EKF_STATUS_REPORT not received",
+                "GPS_RAW_INT not received",
+            ),
         )
+
+    def test_rtk_fix_is_ready_and_a_two_d_fix_is_not(self) -> None:
+        ready = square.apply_mavlink_message(
+            square.copter_readiness_ok(), "GPS_RAW_INT", {"fix_type": 6}
+        )
+        self.assertTrue(ready.ready())
+        held = square.apply_mavlink_message(
+            square.copter_readiness_ok(), "GPS_RAW_INT", {"fix_type": 2}
+        )
+        self.assertEqual(held.blockers(), ("GPS fix 2",))
+        self.assertFalse(held.ready())
+
+    def test_prearm_must_be_present_enabled_and_healthy(self) -> None:
+        base = square.copter_readiness_ok()
+        disabled = square.apply_mavlink_message(
+            base,
+            "SYS_STATUS",
+            _sys_status(present=True, enabled=False, healthy=False),
+        )
+        self.assertEqual(disabled.blockers(), ("prearm check not enabled",))
+        missing = square.apply_mavlink_message(
+            base,
+            "SYS_STATUS",
+            _sys_status(present=False, enabled=False, healthy=False),
+        )
+        self.assertEqual(missing.blockers(), ("prearm check not present",))
+
+    def test_ekf_error_bits_block_and_incomplete_messages_are_ignored(self) -> None:
+        glitch = square.apply_mavlink_message(
+            square.copter_readiness_ok(),
+            "EKF_STATUS_REPORT",
+            {"flags": square._ekf_ready_flags() | square.EKF_GPS_GLITCHING},
+        )
+        self.assertEqual(glitch.blockers(), ("EKF GPS glitch",))
+        ignored = square.apply_mavlink_message(
+            square.CopterReadiness(), "SYS_STATUS", {"load": 1}
+        )
+        self.assertFalse(ignored.sys_status_seen)
+        ignored = square.apply_mavlink_message(
+            ignored, "NOT_A_MESSAGE", {"flags": 1}
+        )
+        self.assertEqual(ignored, square.CopterReadiness())
+
+    def test_interval_request_uses_a_positive_period_and_zero_param3(self) -> None:
+        self.assertEqual(square.interval_us(2.0), 500_000)
+        self.assertEqual(square.interval_us(10.0), 100_000)
+        with self.assertRaises(ValueError):
+            square.interval_us(0.0)
+        fields = square.command_long_fields(
+            target_system=1,
+            message_id=193,
+            interval_us_value=square.interval_us(2.0),
+        )
+        self.assertEqual(fields["command"], square.MAV_CMD_SET_MESSAGE_INTERVAL)
+        self.assertEqual(fields["param1"], 193.0)
+        self.assertEqual(fields["param2"], 500_000.0)
+        self.assertEqual(fields["param3"], 0.0)
+        period = fields["param2"]
+        assert isinstance(period, float)
+        self.assertGreater(period, 0.0)
 
     def _fly(
         self,
@@ -284,7 +368,7 @@ class ArmReadinessTests(unittest.TestCase):
                 caught = exc
         return report, buf.getvalue(), caught
 
-    def test_arm_waits_until_health_is_ready(self) -> None:
+    def test_arm_waits_until_ardupilot_is_ready(self) -> None:
         vehicle = FakeVehicle()
         vehicle.readiness = _not_armable()
         clock = FakeClock()
@@ -293,7 +377,7 @@ class ArmReadinessTests(unittest.TestCase):
         def sleep(dt: float) -> None:
             real_sleep(dt)
             if clock.t >= 1.0:
-                vehicle.readiness = square.arm_readiness_ok()
+                vehicle.readiness = square.copter_readiness_ok()
 
         clock.sleep = sleep  # type: ignore[method-assign]
         report, text, caught = self._fly(vehicle, clock)
@@ -304,20 +388,17 @@ class ArmReadinessTests(unittest.TestCase):
         self.assertGreaterEqual(vehicle.arm_at[0], 1.0)
         self.assertLess(vehicle.calls.index("arm"), vehicle.calls.index("takeoff"))
         self.assertIn("not armable yet", text)
-        self.assertIn("is_armable", text)
-        self.assertIn("global position", text)
-        self.assertIn("home position", text)
-        self.assertIn("gyrometer calibration", text)
+        self.assertIn("prearm check", text)
+        self.assertIn("EKF attitude", text)
+        self.assertIn("GPS fix 1", text)
         self.assertIn("autopilot is armable", text)
 
     def test_timeout_names_the_checks_and_does_not_arm(self) -> None:
         vehicle = FakeVehicle()
-        vehicle.readiness = square.ArmReadiness(
-            reported=True,
-            is_armable=False,
-            is_global_position_ok=True,
-            is_home_position_ok=False,
-            is_gyrometer_calibration_ok=False,
+        vehicle.readiness = square.apply_mavlink_message(
+            square.copter_readiness_ok(),
+            "SYS_STATUS",
+            _sys_status(present=True, enabled=True, healthy=False),
         )
         clock = FakeClock()
         report, text, caught = self._fly(vehicle, clock, arm_timeout_s=0.4)
@@ -325,35 +406,28 @@ class ArmReadinessTests(unittest.TestCase):
         assert caught is not None
         message = str(caught)
         self.assertIn("not armable within 0.4s", message)
-        self.assertIn("is_armable", message)
-        self.assertIn("home position", message)
-        self.assertIn("gyrometer calibration", message)
-        self.assertNotIn("global position", message)
+        self.assertIn("prearm check", message)
+        self.assertNotIn("EKF attitude", message)
+        self.assertNotIn("GPS fix", message)
         self.assertNotIn("arm", vehicle.calls)
         self.assertIn("land", vehicle.calls)
         self.assertIn("not armable yet", text)
 
-    def test_missing_health_is_named(self) -> None:
+    def test_missing_messages_are_named(self) -> None:
         vehicle = FakeVehicle()
-        vehicle.readiness = square.ArmReadiness()
+        vehicle.readiness = square.CopterReadiness()
         clock = FakeClock()
         _report, _text, caught = self._fly(vehicle, clock, arm_timeout_s=0.3)
         assert caught is not None
-        self.assertIn("mavsdk health not received", str(caught))
+        message = str(caught)
+        self.assertIn("SYS_STATUS not received", message)
+        self.assertIn("EKF_STATUS_REPORT not received", message)
+        self.assertIn("GPS_RAW_INT not received", message)
         self.assertNotIn("arm", vehicle.calls)
 
-    def test_false_calibration_does_not_block_an_armable_vehicle(self) -> None:
+    def test_ready_vehicle_arms_without_a_wait(self) -> None:
         vehicle = FakeVehicle()
-        vehicle.readiness = square.ArmReadiness(
-            reported=True,
-            is_armable=True,
-            is_global_position_ok=True,
-            is_home_position_ok=True,
-            is_local_position_ok=False,
-            is_accelerometer_calibration_ok=False,
-            is_gyrometer_calibration_ok=False,
-            is_magnetometer_calibration_ok=False,
-        )
+        vehicle.readiness = square.copter_readiness_ok()
         clock = FakeClock()
         report, text, caught = self._fly(vehicle, clock)
         self.assertIsNone(caught)
@@ -398,43 +472,48 @@ class ArmReadinessTests(unittest.TestCase):
             flight_mode="stabilize",
             failsafe=(),
             link_ok=False,
-            readiness=square.arm_readiness_ok(),
+            readiness=square.copter_readiness_ok(),
         )
         blockers = square._arm_blockers(sample)
         self.assertIn("link down", blockers)
         self.assertIn("landed_state is in_air", blockers)
 
 
-class _Health:
-    def __init__(self, *, armable: bool) -> None:
-        self.is_armable = armable
-        self.is_global_position_ok = armable
-        self.is_home_position_ok = armable
-        self.is_local_position_ok = True
-        self.is_accelerometer_calibration_ok = True
-        self.is_gyrometer_calibration_ok = armable
-        self.is_magnetometer_calibration_ok = True
+class _DirectMessage:
+    def __init__(self, message_name: str, fields: dict[str, object]) -> None:
+        self.message_name = message_name
+        self.fields_json = json.dumps(fields)
+
+    @classmethod
+    def from_mapping(cls, message_name: str, fields: dict[str, int]) -> "_DirectMessage":
+        payload: dict[str, object] = {key: value for key, value in fields.items()}
+        return cls(message_name, payload)
 
 
-class _Plugin:
+class _Direct:
     def __init__(self, system: object) -> None:
         self.system = system
-        self.health_value = _Health(armable=False)
-        self.subscribed = False
+        self.subscriptions: list[tuple[str, Callable[..., None]]] = []
+        self.sent: list[Any] = []
         self.destroyed = False
-        self.fail_subscribe = False
+        self.fail_names: set[str] = set()
+        self.fail_send = False
 
-    def health(self) -> _Health:
-        return self.health_value
-
-    def subscribe_health(self, callback: object, user_data: object = None) -> None:
-        if self.fail_subscribe:
-            raise RuntimeError("subscribe failed")
-        self.subscribed = True
-        self.callback = callback
+    def subscribe_message(
+        self,
+        message_name: str,
+        callback: Callable[..., None],
+        user_data: object = None,
+    ) -> None:
+        if message_name in self.fail_names:
+            raise RuntimeError(f"subscribe {message_name} failed")
+        self.subscriptions.append((message_name, callback))
         self.user_data = user_data
-        if callable(callback):
-            callback(self.health_value, user_data)
+
+    def send_message(self, message: object) -> None:
+        if self.fail_send:
+            raise RuntimeError("send failed")
+        self.sent.append(message)
 
     def destroy(self) -> None:
         self.destroyed = True
@@ -510,88 +589,128 @@ class HealthWatchTests(unittest.TestCase):
         transport._link = link
         return _HealthRobot(transport), action
 
+    def _attach(self, robot: _HealthRobot, direct: _Direct) -> square.CopterReadinessWatch:
+        def factory(system: object) -> _Direct:
+            direct.system = system
+            return direct
+
+        watch = square.CopterReadinessWatch()
+        watch.attach(robot, direct_factory=factory)
+        return watch
+
     def test_watch_uses_the_open_session_and_does_not_need_a_second_socket(self) -> None:
         robot, action = self._robot()
-        plugins: list[_Plugin] = []
-
-        def factory(system: object) -> _Plugin:
-            plugin = _Plugin(system)
-            plugins.append(plugin)
-            return plugin
-
-        watch = square.ArmHealthWatch()
-        watch.attach(robot, telemetry_factory=factory)
-        self.assertEqual(len(plugins), 1)
-        self.assertIs(plugins[0].system, action._owner)
-        self.assertTrue(plugins[0].subscribed)
-        self.assertIsNone(plugins[0].user_data)
-        self.assertIn("reading MAVSDK health", watch.note)
+        direct = _Direct(object())
+        watch = self._attach(robot, direct)
+        names = [name for name, _callback in direct.subscriptions]
+        self.assertEqual(names, ["SYS_STATUS", "GPS_RAW_INT", "EKF_STATUS_REPORT"])
+        self.assertIs(direct.system, action._owner)
+        self.assertIsNone(direct.user_data)
+        self.assertIn("reading ArduPilot SYS_STATUS", watch.note)
         self.assertFalse(watch.poll().ready())
-        self.assertIn("is_armable", watch.poll().detail())
-        self.assertIn("gyrometer calibration", watch.poll().detail())
+        self.assertIn("SYS_STATUS not received", watch.poll().blockers())
+        callback = direct.subscriptions[0][1]
+        assert callable(callback)
+        callback(
+            _DirectMessage.from_mapping(
+                "SYS_STATUS",
+                _sys_status(present=True, enabled=True, healthy=True),
+            ),
+            None,
+        )
+        self.assertNotIn("SYS_STATUS not received", watch.poll().blockers())
+        self.assertNotIn("prearm check", watch.poll().blockers())
         watch.close()
-        self.assertTrue(plugins[0].destroyed)
+        self.assertTrue(direct.destroyed)
 
-    def test_subscribe_failure_still_polls_health(self) -> None:
-        robot, action = self._robot()
-        plugin = _Plugin(action._owner)
-        plugin.fail_subscribe = True
-        plugin.health_value = _Health(armable=True)
+    def test_one_failed_subscription_still_reads_the_others(self) -> None:
+        robot, _action = self._robot()
+        direct = _Direct(object())
+        direct.fail_names.add("EKF_STATUS_REPORT")
+        watch = self._attach(robot, direct)
+        self.assertIn("EKF_STATUS_REPORT", watch.note)
+        names = [name for name, _callback in direct.subscriptions]
+        self.assertIn("SYS_STATUS", names)
+        self.assertIn("GPS_RAW_INT", names)
+        watch.close()
+        self.assertTrue(direct.destroyed)
 
-        def factory(_system: object) -> _Plugin:
-            return plugin
-
-        watch = square.ArmHealthWatch()
-        watch.attach(robot, telemetry_factory=factory)
-        self.assertIn("subscribe_health failed", watch.note)
+    def test_messages_become_ready_and_intervals_keep_param3_zero(self) -> None:
+        robot, _action = self._robot()
+        direct = _Direct(object())
+        watch = self._attach(robot, direct)
+        self.assertGreaterEqual(len(direct.sent), len(square.STREAM_REQUESTS))
+        requested: set[float] = set()
+        for message in direct.sent:
+            fields = json.loads(message.fields_json)
+            self.assertEqual(message.message_name, "COMMAND_LONG")
+            self.assertEqual(message.system_id, square.MAVSDK_GCS_SYSTEM_ID)
+            self.assertEqual(message.component_id, square.MAVSDK_GCS_COMPONENT_ID)
+            self.assertEqual(fields["param3"], 0.0)
+            self.assertGreater(fields["param2"], 0.0)
+            self.assertEqual(fields["command"], square.MAV_CMD_SET_MESSAGE_INTERVAL)
+            requested.add(fields["param1"])
+        for _name, message_id, _rate in square.STREAM_REQUESTS:
+            self.assertIn(float(message_id), requested)
+        self.assertEqual(watch.request_streams(now=1.0), 0)
+        sent_before = len(direct.sent)
+        self.assertEqual(watch.request_streams(now=2.0), len(square.STREAM_REQUESTS))
+        self.assertEqual(len(direct.sent), sent_before + len(square.STREAM_REQUESTS))
+        by_name = {name: callback for name, callback in direct.subscriptions}
+        by_name["SYS_STATUS"](
+            _DirectMessage.from_mapping(
+                "SYS_STATUS",
+                _sys_status(present=True, enabled=True, healthy=True),
+            ),
+            None,
+        )
+        by_name["EKF_STATUS_REPORT"](
+            _DirectMessage.from_mapping(
+                "EKF_STATUS_REPORT", {"flags": square._ekf_ready_flags()}
+            ),
+            None,
+        )
+        by_name["GPS_RAW_INT"](
+            _DirectMessage.from_mapping("GPS_RAW_INT", {"fix_type": 3}),
+            None,
+        )
         self.assertTrue(watch.poll().ready())
         watch.close()
-        self.assertTrue(plugin.destroyed)
 
     def test_missing_session_is_named(self) -> None:
-        watch = square.ArmHealthWatch()
+        watch = square.CopterReadinessWatch()
         watch.attach(object())
         self.assertIn("no autopilot system", watch.note)
-        self.assertEqual(watch.poll().blockers(), ("mavsdk health not received",))
+        self.assertIn("SYS_STATUS not received", watch.poll().blockers())
+        self.assertEqual(watch.request_streams(now=0.0), 0)
 
-    def test_ohho_arm_health_field_is_preferred(self) -> None:
-        robot, action = self._robot()
-        plugin = _Plugin(action._owner)
-        plugin.health_value = _Health(armable=True)
-
-        def factory(_system: object) -> _Plugin:
-            return plugin
-
-        watch = square.ArmHealthWatch()
-        watch.attach(robot, telemetry_factory=factory)
+    def test_published_mavsdk_health_does_not_override_the_prearm_bit(self) -> None:
+        robot, _action = self._robot()
+        direct = _Direct(object())
+        watch = self._attach(robot, direct)
         robot.custom["arm_health"] = {
-            "is_armable": False,
+            "is_armable": True,
             "is_global_position_ok": True,
             "is_home_position_ok": True,
         }
         vehicle = square.OhhoVehicle(robot, object(), health=watch)
         sample = vehicle.read()
         self.assertFalse(sample.readiness.ready())
-        self.assertIn("is_armable", sample.readiness.blockers())
-        self.assertNotIn("global position", sample.readiness.blockers())
+        self.assertIn("SYS_STATUS not received", sample.readiness.blockers())
+        self.assertIn("reading ArduPilot SYS_STATUS", vehicle.arm_health_note)
         vehicle.close()
-        self.assertTrue(plugin.destroyed)
+        self.assertTrue(direct.destroyed)
 
-    def test_plugin_health_is_used_when_ohho_does_not_publish_it(self) -> None:
-        robot, action = self._robot()
-        plugin = _Plugin(action._owner)
-        plugin.health_value = _Health(armable=True)
-
-        def factory(_system: object) -> _Plugin:
-            return plugin
-
-        watch = square.ArmHealthWatch()
-        watch.attach(robot, telemetry_factory=factory)
-        vehicle = square.OhhoVehicle(robot, object(), health=watch)
-        sample = vehicle.read()
-        self.assertTrue(sample.readiness.ready())
-        self.assertIn("reading MAVSDK health", vehicle.arm_health_note)
-        vehicle.close()
+    def test_send_failure_is_logged_and_does_not_arm(self) -> None:
+        robot, _action = self._robot()
+        direct = _Direct(object())
+        direct.fail_send = True
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            watch = self._attach(robot, direct)
+        self.assertIn("message interval request failed", buf.getvalue())
+        self.assertFalse(watch.poll().ready())
+        watch.close()
 
 
 class CliTests(unittest.TestCase):
@@ -622,9 +741,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("4", result.stdout)
         self.assertIn("0.8", result.stdout)
         self.assertIn("sim_vehicle.py", result.stdout)
-        self.assertIn("is_armable", result.stdout)
-        self.assertIn("global position", result.stdout)
-        self.assertIn("home position", result.stdout)
+        self.assertIn("pre-arm", result.stdout)
+        self.assertIn("EKF", result.stdout)
+        self.assertIn("GPS fix_type", result.stdout)
+        self.assertNotIn("is_armable", result.stdout)
         self.assertNotIn("OHHO_ARM_HARDWARE=", result.stdout)
 
     def test_script_does_not_skip_arming_checks(self) -> None:

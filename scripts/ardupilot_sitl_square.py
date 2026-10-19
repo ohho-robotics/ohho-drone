@@ -1,9 +1,9 @@
 """D-07 square on ArduPilot Copter SITL through Ohho ``mavlink+udp://``.
 
 OHH-306. The workflow starts ``sim_vehicle.py -v ArduCopter`` headless at the
-pinned Copter-4.7.2 tag, then this script waits until MAVSDK health says the
-copter is armable, arms, climbs to 2.5 m, flies a 4 m square, and lands.
-``--print-recipe`` only prints those steps.
+pinned Copter-4.7.2 tag, then this script waits until ArduPilot's own pre-arm
+bit, EKF flags, and a 3D GPS fix say the copter is armable, arms, climbs to
+2.5 m, flies a 4 m square, and lands. ``--print-recipe`` only prints those steps.
 
 The script leaves ``OHHO_ARM_HARDWARE`` unset and refuses ``--arm``. The
 loopback transport is a simulation target, so this path does not wrap
@@ -89,6 +89,31 @@ ARM_TIMEOUT_S = 90.0
 ARM_ATTEMPTS = 3
 ARM_RETRY_PAUSE_S = 2.0
 ARM_READY_LOG_S = 5.0
+# Copter-4.7.2 leaves every SR0_* rate at 0 Hz. ``--no-mavproxy`` means nothing
+# else asks for streams. MAVSDK heartbeats then republish a default health
+# object, so ``is_armable`` stays false even after "EKF3 IMU0 is using GPS".
+# These intervals are requested on the open MAVSDK link. They do not change
+# arming checks. param2 is microseconds; 0 would restore the 0 Hz default.
+STREAM_REQUEST_PERIOD_S = 2.0
+MAV_CMD_SET_MESSAGE_INTERVAL = 511
+MAV_SYS_STATUS_PREARM_CHECK = 268435456
+AUTOPILOT_COMPONENT_ID = 1
+# mavsdk 4.0.6 Configuration.create_with_component_type(GROUND_STATION).
+MAVSDK_GCS_SYSTEM_ID = 245
+MAVSDK_GCS_COMPONENT_ID = 190
+GPS_FIX_3D = 3
+EKF_ATTITUDE = 1
+EKF_VELOCITY_HORIZ = 2
+EKF_VELOCITY_VERT = 4
+EKF_POS_HORIZ_REL = 8
+EKF_POS_HORIZ_ABS = 16
+EKF_POS_VERT_ABS = 32
+EKF_CONST_POS_MODE = 128
+EKF_PRED_POS_HORIZ_REL = 256
+EKF_PRED_POS_HORIZ_ABS = 512
+EKF_UNINITIALIZED = 1024
+EKF_ACCEL_ERROR = 2048
+EKF_GPS_GLITCHING = 32768
 CLIMB_TIMEOUT_S = 90.0
 CORNER_TIMEOUT_S = 45.0
 LAND_TIMEOUT_S = 60.0
@@ -127,104 +152,197 @@ class Refused(Exception):
     """The process was asked to arm hardware, or the URI is not loopback SITL."""
 
 
-# MAVSDK Telemetry.Health fields. The first three gate arming. The rest are
-# logged while those three are still false so the timeout names the cause.
-_REQUIRED_HEALTH = (
-    ("is_armable", "is_armable"),
-    ("is_global_position_ok", "global position"),
-    ("is_home_position_ok", "home position"),
+# Same bits ArduPilot's autotest requires before arming with an absolute
+# position (Tools/autotest/vehicle_test_suite.py wait_ekf_happy). On
+# EKF_STATUS_REPORT, bit 1024 is EKF_UNINITIALIZED and bit 15 is GPS glitching.
+_EKF_REQUIRED = (
+    (EKF_ATTITUDE, "EKF attitude"),
+    (EKF_VELOCITY_HORIZ, "EKF horizontal velocity"),
+    (EKF_VELOCITY_VERT, "EKF vertical velocity"),
+    (EKF_POS_HORIZ_REL, "EKF relative horizontal position"),
+    (EKF_POS_HORIZ_ABS, "EKF absolute horizontal position"),
+    (EKF_POS_VERT_ABS, "EKF absolute vertical position"),
+    (EKF_PRED_POS_HORIZ_REL, "EKF predicted relative position"),
+    (EKF_PRED_POS_HORIZ_ABS, "EKF predicted absolute position"),
 )
-_OPTIONAL_HEALTH = (
-    ("is_local_position_ok", "local position"),
-    ("is_accelerometer_calibration_ok", "accelerometer calibration"),
-    ("is_gyrometer_calibration_ok", "gyrometer calibration"),
-    ("is_magnetometer_calibration_ok", "magnetometer calibration"),
+_EKF_ERRORS = (
+    (EKF_CONST_POS_MODE, "EKF const position mode"),
+    (EKF_UNINITIALIZED, "EKF uninitialized"),
+    (EKF_ACCEL_ERROR, "EKF accel error"),
+    (EKF_GPS_GLITCHING, "EKF GPS glitch"),
 )
-_HEALTH_FIELDS = tuple(name for name, _label in _REQUIRED_HEALTH + _OPTIONAL_HEALTH)
+# (message name, MAVLink id, hertz). The first three are the arm gate.
+# The rest are what Ohho already subscribes to; Copter does not send them
+# at the firmware default rate.
+STREAM_REQUESTS = (
+    ("SYS_STATUS", 1, 2.0),
+    ("GPS_RAW_INT", 24, 2.0),
+    ("EKF_STATUS_REPORT", 193, 2.0),
+    ("LOCAL_POSITION_NED", 32, 10.0),
+    ("ATTITUDE", 30, 5.0),
+    ("EXTENDED_SYS_STATE", 245, 2.0),
+)
+_READINESS_MESSAGES = frozenset(name for name, _msg_id, _hz in STREAM_REQUESTS[:3])
 
 
 @dataclass(frozen=True)
-class ArmReadiness:
-    """MAVSDK health, or the same flags when Ohho publishes them.
+class CopterReadiness:
+    """ArduPilot pre-arm bit, EKF flags, and GPS fix. Not MAVSDK health.
 
-    ``ready`` is is_armable plus a global position and a home position.
-    Calibration and local-position flags are diagnostic. A false compass bit
-    on SITL does not block once the pre-arm bit is set.
+    ``ready`` matches Copter autotest ``wait_ready_to_arm`` for an absolute
+    position: SYS_STATUS pre-arm present, enabled, and healthy; the EKF
+    status bits that must be set and the bits that must be clear; and
+    ``GPS_RAW_INT.fix_type >= 3``. A missing message is its own failure.
     """
 
-    reported: bool = False
-    is_armable: bool | None = None
-    is_global_position_ok: bool | None = None
-    is_home_position_ok: bool | None = None
-    is_local_position_ok: bool | None = None
-    is_accelerometer_calibration_ok: bool | None = None
-    is_gyrometer_calibration_ok: bool | None = None
-    is_magnetometer_calibration_ok: bool | None = None
+    sys_status_seen: bool = False
+    prearm_present: bool = False
+    prearm_enabled: bool = False
+    prearm_healthy: bool = False
+    ekf_seen: bool = False
+    ekf_flags: int | None = None
+    gps_seen: bool = False
+    gps_fix_type: int | None = None
 
     def ready(self) -> bool:
-        return (
-            self.reported
-            and self.is_armable is True
-            and self.is_global_position_ok is True
-            and self.is_home_position_ok is True
-        )
+        return not self.blockers()
 
     def blockers(self) -> tuple[str, ...]:
         """Checks that still refuse the arm."""
-        if not self.reported:
-            return ("mavsdk health not received",)
         failed: list[str] = []
-        for attr, label in _REQUIRED_HEALTH:
-            if getattr(self, attr) is not True:
-                failed.append(label)
+        if not self.sys_status_seen:
+            failed.append("SYS_STATUS not received")
+        elif not self.prearm_present:
+            failed.append("prearm check not present")
+        elif not self.prearm_enabled:
+            failed.append("prearm check not enabled")
+        elif not self.prearm_healthy:
+            failed.append("prearm check")
+        if not self.ekf_seen or self.ekf_flags is None:
+            failed.append("EKF_STATUS_REPORT not received")
+        else:
+            flags = self.ekf_flags
+            for bit, label in _EKF_REQUIRED:
+                if not _bit(flags, bit):
+                    failed.append(label)
+            for bit, label in _EKF_ERRORS:
+                if _bit(flags, bit):
+                    failed.append(label)
+        if not self.gps_seen or self.gps_fix_type is None:
+            failed.append("GPS_RAW_INT not received")
+        elif self.gps_fix_type < GPS_FIX_3D:
+            failed.append(f"GPS fix {self.gps_fix_type}")
         return tuple(failed)
 
-    def detail(self) -> tuple[str, ...]:
-        """Blockers plus calibration and local-position flags that are false."""
-        extra: list[str] = []
-        if self.reported:
-            for attr, label in _OPTIONAL_HEALTH:
-                if getattr(self, attr) is False:
-                    extra.append(label)
-        return self.blockers() + tuple(extra)
+
+def _bit(mask: int, flag: int) -> bool:
+    return (mask & flag) == flag
 
 
-def arm_readiness_ok() -> ArmReadiness:
-    """Health that may arm. Tests use this as the default sample."""
-    return ArmReadiness(
-        reported=True,
-        is_armable=True,
-        is_global_position_ok=True,
-        is_home_position_ok=True,
-        is_local_position_ok=True,
-        is_accelerometer_calibration_ok=True,
-        is_gyrometer_calibration_ok=True,
-        is_magnetometer_calibration_ok=True,
-    )
-
-
-def _health_flag(value: object) -> bool | None:
-    if isinstance(value, bool):
+def _mav_int(value: object) -> int | None:
+    """Integer field from a MAVSDK fields_json object. Bools are not numbers."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
         return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        sign = text[1:] if text.startswith("-") else text
+        if sign.isdigit():
+            return int(text)
     return None
 
 
-def arm_readiness_from_mapping(payload: Mapping[str, object]) -> ArmReadiness | None:
-    """Build readiness from a dict that contains ``is_armable``."""
-    if "is_armable" not in payload:
-        return None
-    flags = {name: _health_flag(payload.get(name)) for name in _HEALTH_FIELDS}
-    if not any(flag is not None for flag in flags.values()):
-        return None
-    return ArmReadiness(reported=True, **flags)
+def apply_mavlink_message(
+    state: CopterReadiness, message_name: str, fields: Mapping[str, object]
+) -> CopterReadiness:
+    """Fold one decoded MAVLink message into ``state``. Unknown names are ignored."""
+    name = message_name.strip().upper()
+    if name == "SYS_STATUS":
+        present = _mav_int(fields.get("onboard_control_sensors_present"))
+        enabled = _mav_int(fields.get("onboard_control_sensors_enabled"))
+        health = _mav_int(fields.get("onboard_control_sensors_health"))
+        if present is None or enabled is None or health is None:
+            return state
+        return CopterReadiness(
+            sys_status_seen=True,
+            prearm_present=_bit(present, MAV_SYS_STATUS_PREARM_CHECK),
+            prearm_enabled=_bit(enabled, MAV_SYS_STATUS_PREARM_CHECK),
+            prearm_healthy=_bit(health, MAV_SYS_STATUS_PREARM_CHECK),
+            ekf_seen=state.ekf_seen,
+            ekf_flags=state.ekf_flags,
+            gps_seen=state.gps_seen,
+            gps_fix_type=state.gps_fix_type,
+        )
+    if name == "EKF_STATUS_REPORT":
+        flags = _mav_int(fields.get("flags"))
+        if flags is None:
+            return state
+        return CopterReadiness(
+            sys_status_seen=state.sys_status_seen,
+            prearm_present=state.prearm_present,
+            prearm_enabled=state.prearm_enabled,
+            prearm_healthy=state.prearm_healthy,
+            ekf_seen=True,
+            ekf_flags=flags,
+            gps_seen=state.gps_seen,
+            gps_fix_type=state.gps_fix_type,
+        )
+    if name == "GPS_RAW_INT":
+        fix_type = _mav_int(fields.get("fix_type"))
+        if fix_type is None:
+            return state
+        return CopterReadiness(
+            sys_status_seen=state.sys_status_seen,
+            prearm_present=state.prearm_present,
+            prearm_enabled=state.prearm_enabled,
+            prearm_healthy=state.prearm_healthy,
+            ekf_seen=state.ekf_seen,
+            ekf_flags=state.ekf_flags,
+            gps_seen=True,
+            gps_fix_type=fix_type,
+        )
+    return state
 
 
-def arm_readiness_from_health(health: object) -> ArmReadiness | None:
-    """Build readiness from a MAVSDK ``Health`` object."""
-    if health is None:
+def _ekf_ready_flags() -> int:
+    flags = 0
+    for bit, _label in _EKF_REQUIRED:
+        flags |= bit
+    return flags
+
+
+def copter_readiness_ok() -> CopterReadiness:
+    """Pre-arm, EKF, and a 3D fix. Tests use this as the default sample."""
+    state = apply_mavlink_message(
+        CopterReadiness(),
+        "SYS_STATUS",
+        {
+            "onboard_control_sensors_present": MAV_SYS_STATUS_PREARM_CHECK,
+            "onboard_control_sensors_enabled": MAV_SYS_STATUS_PREARM_CHECK,
+            "onboard_control_sensors_health": MAV_SYS_STATUS_PREARM_CHECK,
+        },
+    )
+    state = apply_mavlink_message(
+        state, "EKF_STATUS_REPORT", {"flags": _ekf_ready_flags()}
+    )
+    return apply_mavlink_message(state, "GPS_RAW_INT", {"fix_type": GPS_FIX_3D})
+
+
+def parse_mavlink_fields(fields_json: object) -> Mapping[str, object] | None:
+    """Decode ``fields_json``. A non-object payload is ignored."""
+    if not isinstance(fields_json, str) or not fields_json:
         return None
-    payload = {name: getattr(health, name, None) for name in _HEALTH_FIELDS}
-    return arm_readiness_from_mapping(payload)
+    try:
+        payload = json.loads(fields_json)
+    except json.JSONDecodeError:
+        return None
+    parsed = _string_mapping(payload)
+    return parsed
 
 
 def _string_mapping(value: object) -> Mapping[str, object] | None:
@@ -233,26 +351,30 @@ def _string_mapping(value: object) -> Mapping[str, object] | None:
     return {str(key): item for key, item in value.items()}
 
 
-def arm_readiness_from_telemetry(
-    custom: Mapping[str, object], drone: Mapping[str, object]
-) -> ArmReadiness | None:
-    """Ohho-published health, when the backend has started sending it.
+def interval_us(rate_hz: float) -> int:
+    """``MAV_CMD_SET_MESSAGE_INTERVAL`` param2. Never 0 or negative."""
+    if rate_hz <= 0.0:
+        raise ValueError("stream rate must be positive")
+    return int(round(1_000_000 / rate_hz))
 
-    Checked before the direct MAVSDK plugin. ``custom["arm_health"]`` is the
-    place that does not change ``DRONE_TELEMETRY_KEYS``.
-    """
-    for source in (
-        custom.get("arm_health"),
-        drone.get("health"),
-        drone if "is_armable" in drone else None,
-    ):
-        payload = _string_mapping(source)
-        if payload is None:
-            continue
-        parsed = arm_readiness_from_mapping(payload)
-        if parsed is not None:
-            return parsed
-    return None
+
+def command_long_fields(
+    *, target_system: int, message_id: int, interval_us_value: int
+) -> dict[str, object]:
+    """COMMAND_LONG body. param3 stays 0; Copter denies any other value."""
+    return {
+        "target_system": target_system,
+        "target_component": AUTOPILOT_COMPONENT_ID,
+        "command": MAV_CMD_SET_MESSAGE_INTERVAL,
+        "confirmation": 0,
+        "param1": float(message_id),
+        "param2": float(interval_us_value),
+        "param3": 0.0,
+        "param4": 0.0,
+        "param5": 0.0,
+        "param6": 0.0,
+        "param7": 0.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -265,7 +387,7 @@ class VehicleSample:
     flight_mode: str
     failsafe: tuple[str, ...]
     link_ok: bool
-    readiness: ArmReadiness = field(default_factory=arm_readiness_ok)
+    readiness: CopterReadiness = field(default_factory=copter_readiness_ok)
 
 
 @dataclass
@@ -391,9 +513,12 @@ def recipe() -> str:
             f"  {launch}",
             "",
             "1. Wait until the autopilot reports on_ground on the loopback link.",
-            "2. Wait until MAVSDK health reports is_armable, a global position, "
-            "and a home position. The wait is bounded and prints each check "
-            "that is still failing. Arming checks stay at their defaults.",
+            "2. Request SYS_STATUS, EKF_STATUS_REPORT, and GPS_RAW_INT on the "
+            "open link (Copter's SR0_* rates are 0). Wait until the pre-arm "
+            "check bit is healthy, the EKF flags match an absolute-position "
+            "ready-to-arm, and GPS fix_type is at least 3. The wait is bounded "
+            "and prints each check that is still failing. Arming checks stay "
+            "at their defaults.",
             "3. Arm the autopilot (MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0). "
             f"A rejected arm is retried {ARM_ATTEMPTS} times.",
             f"4. Take off to {TAKEOFF_ALT_M} m. Pass the climb when "
@@ -650,7 +775,7 @@ def _arm_blockers(sample: VehicleSample) -> tuple[str, ...]:
     if sample.landed_state != "on_ground":
         reasons.append(f"landed_state is {sample.landed_state}")
     if not sample.readiness.ready():
-        reasons.extend(sample.readiness.detail())
+        reasons.extend(sample.readiness.blockers())
     return tuple(reasons)
 
 
@@ -662,7 +787,10 @@ def _wait_until_armable(
     monotonic: Callable[[], float],
     period_s: float,
 ) -> VehicleSample:
-    """Block until health says the copter can arm. Do not send an arm command."""
+    """Block until ArduPilot's pre-arm, EKF, and GPS say it can arm.
+
+    Does not send an arm command. Stream requests are not arming checks.
+    """
     note = getattr(vehicle, "arm_health_note", None)
     if isinstance(note, str) and note:
         print(note, flush=True)
@@ -671,8 +799,9 @@ def _wait_until_armable(
     started = monotonic()
     last_text: str | None = None
     last_log = started
-    reasons: tuple[str, ...] = ("mavsdk health not received",)
+    reasons: tuple[str, ...] = CopterReadiness().blockers()
     while monotonic() < deadline:
+        _request_vehicle_streams(vehicle, monotonic())
         sample = _read(vehicle)
         _raise_if_flags(sample)
         reasons = _arm_blockers(sample)
@@ -692,6 +821,16 @@ def _wait_until_armable(
     raise SquareFailed(
         f"not armable within {timeout_s:g}s: {', '.join(reasons)}"
     )
+
+
+def _request_vehicle_streams(vehicle: object, now: float) -> None:
+    request = getattr(vehicle, "request_streams", None)
+    if not callable(request):
+        return
+    try:
+        request(now=now)
+    except TypeError:
+        request()
 
 
 def _arm_with_retries(
@@ -825,15 +964,77 @@ class _FlightRobot(Protocol):
     def disconnect(self) -> None: ...
 
 
-def _mavsdk_telemetry(system: object) -> object:
-    """Second Telemetry plugin on a system Ohho already discovered.
+def _mavlink_direct(system: object) -> object:
+    """MavlinkDirect on a system Ohho already discovered.
 
-    This does not open a socket. The SITL stream is already owned by the
-    session that discovered the autopilot.
+    mavsdk 4.0.6 has no ``MavlinkPassthrough`` plugin. ``MavlinkDirect`` is
+    the same-link replacement: it does not open a socket. A second ``udpin``
+    listener would take the only SITL stream away from Ohho.
     """
-    from mavsdk.plugins.telemetry import Telemetry
+    from mavsdk.plugins.mavlink_direct import MavlinkDirect
 
-    return Telemetry(system)
+    return MavlinkDirect(system)
+
+
+def _direct_message(
+    *,
+    message_name: str,
+    target_system: int,
+    fields: Mapping[str, object],
+) -> object:
+    fields_json = json.dumps(fields)
+    try:
+        from mavsdk.plugins.mavlink_direct import MavlinkMessage
+    except ImportError:
+        return _FallbackDirectMessage(
+            message_name=message_name,
+            system_id=MAVSDK_GCS_SYSTEM_ID,
+            component_id=MAVSDK_GCS_COMPONENT_ID,
+            target_system_id=target_system,
+            target_component_id=AUTOPILOT_COMPONENT_ID,
+            fields_json=fields_json,
+        )
+    return MavlinkMessage(
+        message_name=message_name,
+        system_id=MAVSDK_GCS_SYSTEM_ID,
+        component_id=MAVSDK_GCS_COMPONENT_ID,
+        target_system_id=target_system,
+        target_component_id=AUTOPILOT_COMPONENT_ID,
+        fields_json=fields_json,
+    )
+
+
+class _FallbackDirectMessage:
+    """Stand-in used when the unit tests do not have mavsdk installed."""
+
+    def __init__(
+        self,
+        *,
+        message_name: str,
+        system_id: int,
+        component_id: int,
+        target_system_id: int,
+        target_component_id: int,
+        fields_json: str,
+    ) -> None:
+        self.message_name = message_name
+        self.system_id = system_id
+        self.component_id = component_id
+        self.target_system_id = target_system_id
+        self.target_component_id = target_component_id
+        self.fields_json = fields_json
+
+
+def _target_system_id(system: object) -> int:
+    getter = getattr(system, "get_system_id", None)
+    if callable(getter):
+        try:
+            value = getter()
+        except Exception:
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 1
 
 
 def _autopilot_system(robot: object) -> object | None:
@@ -867,14 +1068,17 @@ def _autopilot_system(robot: object) -> object | None:
     return chosen
 
 
-class ArmHealthWatch:
-    """Poll MAVSDK health on the session Ohho already opened."""
+class CopterReadinessWatch:
+    """SYS_STATUS, EKF_STATUS_REPORT, and GPS_RAW_INT on Ohho's open session."""
 
     def __init__(self) -> None:
-        self._plugin: object | None = None
-        self._note = "mavsdk health not attached"
+        self._direct: object | None = None
+        self._note = "ardupilot readiness not attached"
         self._lock = threading.Lock()
-        self._latest = ArmReadiness()
+        self._latest = CopterReadiness()
+        self._target_system = 1
+        self._last_request: float | None = None
+        self._announced = False
 
     @property
     def note(self) -> str:
@@ -884,67 +1088,121 @@ class ArmHealthWatch:
         self,
         robot: object,
         *,
-        telemetry_factory: Callable[[object], object] | None = None,
+        direct_factory: Callable[[object], object] | None = None,
     ) -> None:
         system = _autopilot_system(robot)
         if system is None:
             self._note = (
-                "mavsdk health not attached: the open session has no autopilot system"
+                "ardupilot readiness not attached: "
+                "the open session has no autopilot system"
             )
             return
-        factory = _mavsdk_telemetry if telemetry_factory is None else telemetry_factory
+        self._target_system = _target_system_id(system)
+        factory = _mavlink_direct if direct_factory is None else direct_factory
         try:
-            plugin = factory(system)
+            direct = factory(system)
         except Exception as exc:
-            self._note = f"mavsdk health not attached: {exc}"
+            self._note = f"ardupilot readiness not attached: {exc}"
             return
-        self._plugin = plugin
-        subscribe_error = ""
-        subscribed = False
-        subscribe = getattr(plugin, "subscribe_health", None)
-        if callable(subscribe):
+        subscribe = getattr(direct, "subscribe_message", None)
+        if not callable(subscribe):
+            self._note = (
+                "ardupilot readiness not attached: "
+                "mavlink direct has no subscribe_message()"
+            )
+            return
+        errors: list[str] = []
+        subscribed = 0
+        for name, _message_id, _rate_hz in STREAM_REQUESTS:
+            if name not in _READINESS_MESSAGES:
+                continue
             try:
-                subscribe(self._on_health)
-                subscribed = True
+                subscribe(name, self._on_message)
+                subscribed += 1
             except Exception as exc:
-                subscribe_error = str(exc)
-        can_poll = callable(getattr(plugin, "health", None))
-        if not can_poll and not subscribed:
-            reason = subscribe_error or "telemetry plugin has no health()"
-            self._note = f"mavsdk health not attached: {reason}"
-            self._plugin = None
+                errors.append(f"{name}: {exc}")
+        if subscribed == 0:
+            detail = "; ".join(errors) or "no message subscription"
+            self._note = f"ardupilot readiness not attached: {detail}"
             return
-        self._note = "reading MAVSDK health on the open session"
-        if subscribe_error:
-            self._note += f" (subscribe_health failed: {subscribe_error})"
-        self.poll()
+        self._direct = direct
+        self._note = (
+            "reading ArduPilot SYS_STATUS, EKF_STATUS_REPORT, and "
+            "GPS_RAW_INT on the open session"
+        )
+        if errors:
+            self._note += f" ({'; '.join(errors)})"
+        self.request_streams(now=0.0, force=True)
 
-    def _on_health(self, health: object, _user_data: object = None) -> None:
-        parsed = arm_readiness_from_health(health)
-        if parsed is None:
+    def request_streams(self, *, now: float | None = None, force: bool = False) -> int:
+        """Ask Copter to emit the arm-gate and flight messages. Returns how many were sent."""
+        direct = self._direct
+        if direct is None:
+            return 0
+        stamp = time.monotonic() if now is None else now
+        if (
+            not force
+            and self._last_request is not None
+            and stamp - self._last_request < STREAM_REQUEST_PERIOD_S
+        ):
+            return 0
+        send = getattr(direct, "send_message", None)
+        if not callable(send):
+            self._note = (
+                "reading ArduPilot readiness, but mavlink direct has no send_message()"
+            )
+            return 0
+        sent: list[str] = []
+        errors: list[str] = []
+        for name, message_id, rate_hz in STREAM_REQUESTS:
+            fields = command_long_fields(
+                target_system=self._target_system,
+                message_id=message_id,
+                interval_us_value=interval_us(rate_hz),
+            )
+            message = _direct_message(
+                message_name="COMMAND_LONG",
+                target_system=self._target_system,
+                fields=fields,
+            )
+            try:
+                send(message)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+                continue
+            sent.append(f"{name} {rate_hz:g} Hz")
+        self._last_request = stamp
+        if sent and not self._announced:
+            print(
+                "requested ArduPilot message intervals: " + ", ".join(sent),
+                flush=True,
+            )
+            self._announced = True
+        if errors:
+            print(
+                "message interval request failed: " + "; ".join(errors),
+                flush=True,
+            )
+        return len(sent)
+
+    def _on_message(self, message: object, _user_data: object = None) -> None:
+        name = getattr(message, "message_name", None)
+        if not isinstance(name, str):
+            return
+        fields = parse_mavlink_fields(getattr(message, "fields_json", None))
+        if fields is None:
             return
         with self._lock:
-            self._latest = parsed
+            self._latest = apply_mavlink_message(self._latest, name, fields)
 
-    def poll(self) -> ArmReadiness:
-        plugin = self._plugin
-        if plugin is not None:
-            getter = getattr(plugin, "health", None)
-            if callable(getter):
-                try:
-                    parsed = arm_readiness_from_health(getter())
-                except Exception:
-                    parsed = None
-                if parsed is not None:
-                    with self._lock:
-                        self._latest = parsed
+    def poll(self) -> CopterReadiness:
         with self._lock:
             return self._latest
 
     def close(self) -> None:
-        plugin = self._plugin
-        self._plugin = None
-        destroy = getattr(plugin, "destroy", None)
+        direct = self._direct
+        self._direct = None
+        destroy = getattr(direct, "destroy", None)
         if callable(destroy):
             try:
                 destroy()
@@ -964,17 +1222,20 @@ class OhhoVehicle:
         robot: _FlightRobot,
         frame: object,
         *,
-        health: ArmHealthWatch | None = None,
+        health: CopterReadinessWatch | None = None,
     ) -> None:
         self._robot = robot
         self._frame = frame
-        self._health = ArmHealthWatch() if health is None else health
+        self._health = CopterReadinessWatch() if health is None else health
         if health is None:
             self._health.attach(robot)
 
     @property
     def arm_health_note(self) -> str:
         return self._health.note
+
+    def request_streams(self, *, now: float | None = None) -> int:
+        return self._health.request_streams(now=now)
 
     def read(self) -> VehicleSample:
         tele = self._robot.telemetry()
@@ -990,11 +1251,6 @@ class OhhoVehicle:
         flags = drone.get("failsafe") or ()
         if isinstance(flags, str) or not isinstance(flags, Sequence):
             flags = ()
-        custom_map = _string_mapping(custom) or {}
-        drone_map = _string_mapping(drone) or {}
-        readiness = arm_readiness_from_telemetry(custom_map, drone_map)
-        if readiness is None:
-            readiness = self._health.poll()
         return VehicleSample(
             x=float(pose["x"]),
             y=float(pose["y"]),
@@ -1004,7 +1260,7 @@ class OhhoVehicle:
             flight_mode=str(drone.get("flight_mode", "unknown")),
             failsafe=tuple(str(flag) for flag in flags),
             link_ok=bool(drone.get("link_ok")),
-            readiness=readiness,
+            readiness=self._health.poll(),
         )
 
     def arm(self) -> None:
