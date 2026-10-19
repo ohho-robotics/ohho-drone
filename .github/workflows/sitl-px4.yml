@@ -8,6 +8,8 @@
 # The plan's cold-start budget is 20 minutes for a prebuilt image. The hard
 # timeout is 40 minutes so a cold Gazebo install and PX4 compile can finish
 # and record a runtime against that budget. CI does not set OHHO_ARM_HARDWARE.
+# The square step alone sets OHHO_CI_SIM_ARMING and OHHO_CI_SITL. The aerial
+# SafetyGate stays enforced.
 #
 # Headless SITL has no ground station. scripts/sitl_gcs_heartbeat.py sends a
 # MAVLink HEARTBEAT (MAV_TYPE_GCS) at the stock GCS port so PX4's pre-arm
@@ -64,7 +66,7 @@ jobs:
 
       - name: Refuse hardware arming
         run: |
-          if [ "${OHHO_ARM_HARDWARE:-}" = "1" ]; then
+          if [ -n "${OHHO_ARM_HARDWARE+x}" ]; then
             echo "refusing to run: OHHO_ARM_HARDWARE is set" >&2
             exit 1
           fi
@@ -97,6 +99,9 @@ jobs:
           esac
 
       - name: Fly the square
+        env:
+          OHHO_CI_SIM_ARMING: "1"
+          OHHO_CI_SITL: "1"
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -110,6 +115,8 @@ jobs:
             -e LIBGL_ALWAYS_SOFTWARE=1 \
             -e CI="${CI}" \
             -e GITHUB_ACTIONS="${GITHUB_ACTIONS}" \
+            -e OHHO_CI_SIM_ARMING="${OHHO_CI_SIM_ARMING}" \
+            -e OHHO_CI_SITL="${OHHO_CI_SITL}" \
             -v "$GITHUB_WORKSPACE:/opt/ohho-drone:ro" \
             -v "$GITHUB_WORKSPACE/artifacts:/artifacts" \
             "${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}" \

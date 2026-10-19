@@ -3,7 +3,9 @@
 
 The vehicle commands go through ``Robot`` and the aerial ``SafetyGate``. This
 script does not set ``OHHO_ARM_HARDWARE``, does not pass a force-disarm, and
-does not accept a non-loopback ``px4+dds://`` URI.
+does not accept a non-loopback ``px4+dds://`` URI. Under GitHub Actions it
+connects only when ``OHHO_CI_SIM_ARMING`` and ``OHHO_CI_SITL`` are both
+exactly ``1``. That opt-in does not bypass the gate.
 
 Nothing in this module imports Ohho at import time, so the mission rules can
 be tested without ROS or the simulator.
@@ -57,7 +59,8 @@ CRITERIA: dict[str, float] = {
 PREFLIGHT_TAIL_LINES = 100
 PREFLIGHT_TAIL_BYTES = 262144
 _PREFLIGHT_FAIL = re.compile(r"Preflight Fail:\s*(.+)")
-# SafetyGate._human_tty_reason. ci is CI/GITHUB_ACTIONS; no_tty is headless.
+# SafetyGate._human_tty_reason. ci is CI without OHHO_CI_SIM_ARMING=1 and
+# OHHO_CI_SITL=1; no_tty is a headless caller outside that sim-only opt-in.
 HUMAN_TTY_REASONS = frozenset({"ci", "no_tty"})
 
 
@@ -219,16 +222,19 @@ def flight_refusal(label: str, error: str) -> str:
     """How a SafetyGate flight refusal is written into the result.
 
     ``ci`` and ``no_tty`` come from ``_human_tty_reason`` inside
-    ``_aerial_privileged``. The mission stops there. It does not pretend a
+    ``_aerial_privileged``. Those reasons still stop the mission unless the
+    sim-only opt-in applies (``OHHO_CI_SIM_ARMING=1`` and ``OHHO_CI_SITL=1``,
+    plus the rest of the ohho-os conditions). The script does not pretend a
     human is present.
     """
     if error in HUMAN_TTY_REASONS:
         return (
             f"{label} refused by SafetyGate ({error}): ohho-os "
             "_human_tty_reason / _aerial_privileged blocks arm_flight and "
-            "takeoff when CI or GITHUB_ACTIONS is set, and when stdin is not "
-            "a TTY. This script does not allocate a fake TTY, clear CI, or "
-            "set OHHO_ARM_HARDWARE."
+            "takeoff in CI unless OHHO_CI_SIM_ARMING=1 and OHHO_CI_SITL=1 "
+            "opt this loopback SITL in, and when stdin is not a TTY outside "
+            "that opt-in. This script does not allocate a fake TTY, clear CI, "
+            "or set OHHO_ARM_HARDWARE."
         )
     return f"{label} refused by SafetyGate: {error}"
 
@@ -292,12 +298,40 @@ def hardware_arming_block(requires_hardware_arming: bool) -> Optional[str]:
 
 
 def refuse_hardware_arm_env(environ: dict[str, str]) -> None:
-    """Stop if a caller already enabled the hardware-arming switch."""
-    if environ.get("OHHO_ARM_HARDWARE") == "1":
+    """Stop if ``OHHO_ARM_HARDWARE`` is present at all.
+
+    The sim-only CI exception requires the variable to be absent, including
+    when the value is empty or not ``1``. This script never sets it.
+    """
+    if "OHHO_ARM_HARDWARE" in environ:
         raise MissionError(
             "OHHO_ARM_HARDWARE is set. This SITL script does not run with "
             "hardware arming enabled."
         )
+
+
+def _github_actions(environ: dict[str, str]) -> bool:
+    value = environ.get("GITHUB_ACTIONS", "")
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def require_ci_sim_opt_in(environ: dict[str, str]) -> None:
+    """Refuse to connect on GitHub Actions without the sim-only opt-in.
+
+    ``OHHO_CI_SIM_ARMING`` and ``OHHO_CI_SITL`` must both be exactly ``1``.
+    This does not arm, does not set ``OHHO_ARM_HARDWARE``, and does not
+    bypass ``SafetyGate``. Callers outside GitHub Actions are unchanged.
+    """
+    if not _github_actions(environ):
+        return
+    if environ.get("OHHO_CI_SIM_ARMING") == "1" and environ.get("OHHO_CI_SITL") == "1":
+        return
+    raise MissionError(
+        "refusing to connect under GitHub Actions without "
+        "OHHO_CI_SIM_ARMING=1 and OHHO_CI_SITL=1. The aerial SafetyGate "
+        "stays enforced. This script does not allocate a fake TTY, clear CI, "
+        "or set OHHO_ARM_HARDWARE."
+    )
 
 
 def _loopback_host(host: str) -> bool:
@@ -865,7 +899,12 @@ def connect_and_run(
     log: Callable[[str], None] = print,
     console_path: str = "",
 ) -> MissionResult:
-    """Connect ``px4-sitl`` through the aerial gate and fly the square."""
+    """Connect ``px4-sitl`` through the aerial gate and fly the square.
+
+    This is the fly path. Under GitHub Actions it raises before connecting
+    unless ``OHHO_CI_SIM_ARMING`` and ``OHHO_CI_SITL`` are both exactly ``1``.
+    """
+    require_ci_sim_opt_in(dict(os.environ))
     check_sitl_uri(uri)
     try:
         from ohho import capabilities as caps
@@ -976,6 +1015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         refuse_hardware_arm_env(dict(os.environ))
         check_sitl_uri(args.uri)
+        require_ci_sim_opt_in(dict(os.environ))
         result = connect_and_run(args.uri, console_path=args.px4_console)
     except MissionError as exc:
         result = _blank_result([str(exc)])

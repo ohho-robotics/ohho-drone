@@ -107,29 +107,30 @@ Commands go through `Robot` and the aerial `SafetyGate`. The URI has to be a
 loopback `px4+dds://` host (`127.0.0.0/8`, `localhost`, or `::1`).
 
 The script and the workflow do not set `OHHO_ARM_HARDWARE`. If that variable
-is already `1`, they exit. They do not pass `--arm`. DDS stays inside the
+is present at all, they exit. They do not pass `--arm`. DDS stays inside the
 container, so the recipe does not use host networking or `--privileged`.
 
-GitHub Actions forwards `CI` and `GITHUB_ACTIONS` into the container. The gate
-sees that this is CI.
+The "Fly the square" step sets `OHHO_CI_SIM_ARMING=1` and `OHHO_CI_SITL=1`
+and passes both into the container with `CI` and `GITHUB_ACTIONS`. That is
+the sim-only CI arming opt-in. It applies only when `CI` and
+`GITHUB_ACTIONS` are true, `OHHO_ARM_HARDWARE` is absent, the gate is not a
+hardware gate, and this loopback `px4+dds` target has `sim_target` true.
+Under GitHub Actions, `scripts/sitl_square.py` refuses to connect when
+either variable is not exactly `1`.
 
-On the public `ohh-290-px4-dds` branch at `5acb80e`, `px4-sitl` uses the
-aerial profile, and `requires_hardware_arming` is false when the transport's
-`sim_target` is true. `arm()` on that sim target does not ask for a human
-TTY. `arm_flight` and `takeoff` still call `_human_tty_reason` from
-`_aerial_privileged`, which returns `ci` when `CI` or `GITHUB_ACTIONS` is
-set, before it looks at the sim flag. A headless runner also has no TTY
-(`no_tty`).
+The gate stays fully enforced: geofence, altitude cap, battery, link, the
+setpoint stream, the allowlist, speed caps, and the e-stop. The script does
+not clear `CI`, allocate a fake TTY, set `OHHO_ARM_HARDWARE`, or call
+`send_flight` on the inner transport. `OHHO_OS_REF` stays `ohh-290-px4-dds`.
+After install, the container log prints the resolved ohho-os commit.
 
-When that happens the mission stops before takeoff. `sitl-result.json`
-`reasons` names `_human_tty_reason`, `_aerial_privileged`, and the gate
-reason (`ci` or `no_tty`). The script does not clear `CI`, allocate a fake
-TTY, set `OHHO_ARM_HARDWARE`, or call `send_flight` on the inner transport.
-
-That gate is a decision for the Ohho maintainers. This recipe does not
-bypass it. Switch the Ohho install from `ohh-290-px4-dds` to `main` once
-that branch has merged. The square can pass only after the gate allows
-`arm_flight` and `takeoff` for this loopback target from a headless CI job.
+`arm()` on a `sim_target` does not ask for a human TTY, and
+`requires_hardware_arming` is false for that target. `arm_flight` and
+`takeoff` still go through `_human_tty_reason` and `_aerial_privileged`.
+Without the opt-in, CI is reason `ci` and a headless process is `no_tty`.
+`sitl-result.json` names that refusal. The square can pass only when the
+installed ohho-os includes the exception and every remaining gate check
+passes. This page does not claim that a flight has already happened.
 
 ## Local recipe
 
@@ -153,10 +154,10 @@ docker exec ohho-px4 bash /opt/ohho-drone/scripts/run_sitl_px4.sh
 docker rm -f ohho-px4
 ```
 
-That `docker exec` has no TTY, and the recipe does not set `OHHO_ARM_HARDWARE`.
-On the current gate, `arm_flight` and `takeoff` are refused without a TTY. The
-commands are the ones a later gate can run unchanged. They are not a completed
-flight.
+That `docker exec` has no TTY, and the recipe does not set `OHHO_ARM_HARDWARE`
+or the CI opt-in variables. Outside GitHub Actions, `arm_flight` and
+`takeoff` are refused without a TTY. The local command is the same script
+the CI job runs, without that opt-in. It is not a completed flight.
 
 Confirm the image digest is the index or amd64 digest in the table before
 trusting a retag of `v1.17.0`. `scripts/run_sitl_px4.sh` checks out PX4

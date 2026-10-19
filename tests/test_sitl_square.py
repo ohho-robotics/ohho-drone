@@ -231,9 +231,13 @@ class UriAndSafetyTest(unittest.TestCase):
                 sitl_square.check_sitl_uri(uri)
 
     def test_hardware_arm_env_is_refused(self) -> None:
-        with self.assertRaises(sitl_square.MissionError):
-            sitl_square.refuse_hardware_arm_env({"OHHO_ARM_HARDWARE": "1"})
+        for value in ("1", "0", "", "true", "yes"):
+            with self.assertRaises(sitl_square.MissionError):
+                sitl_square.refuse_hardware_arm_env({"OHHO_ARM_HARDWARE": value})
         sitl_square.refuse_hardware_arm_env({})
+        sitl_square.refuse_hardware_arm_env(
+            {"OHHO_CI_SIM_ARMING": "1", "OHHO_CI_SITL": "1"}
+        )
 
     def test_hardware_classification_blocks_before_any_phrase(self) -> None:
         self.assertIsNone(sitl_square.hardware_arming_block(False))
@@ -253,9 +257,66 @@ class UriAndSafetyTest(unittest.TestCase):
         self.assertEqual(code, 1)
 
     def test_main_refuses_a_preset_hardware_arm_variable(self) -> None:
-        with mock.patch.dict(os.environ, {"OHHO_ARM_HARDWARE": "1"}):
-            code = sitl_square.main(["--uri", sitl_square.DEFAULT_URI])
+        for value in ("1", "", "0"):
+            with mock.patch.dict(os.environ, {"OHHO_ARM_HARDWARE": value}):
+                with mock.patch.object(sitl_square, "connect_and_run") as connect:
+                    code = sitl_square.main(["--uri", sitl_square.DEFAULT_URI])
+            self.assertEqual(code, 1)
+            connect.assert_not_called()
+
+    def test_github_actions_refuses_to_connect_without_both_opt_ins(self) -> None:
+        incomplete = (
+            {"GITHUB_ACTIONS": "true"},
+            {"GITHUB_ACTIONS": "true", "OHHO_CI_SIM_ARMING": "1"},
+            {"GITHUB_ACTIONS": "true", "OHHO_CI_SITL": "1"},
+            {"GITHUB_ACTIONS": " True ", "OHHO_CI_SIM_ARMING": "1", "OHHO_CI_SITL": "true"},
+            {"GITHUB_ACTIONS": "true", "OHHO_CI_SIM_ARMING": "1", "OHHO_CI_SITL": ""},
+        )
+        for env in incomplete:
+            with self.assertRaises(sitl_square.MissionError) as caught:
+                sitl_square.require_ci_sim_opt_in(env)
+            message = str(caught.exception)
+            self.assertIn("OHHO_CI_SIM_ARMING=1", message)
+            self.assertIn("OHHO_CI_SITL=1", message)
+        sitl_square.require_ci_sim_opt_in({})
+        sitl_square.require_ci_sim_opt_in(
+            {"CI": "true", "OHHO_CI_SIM_ARMING": "1", "OHHO_CI_SITL": "1"}
+        )
+        sitl_square.require_ci_sim_opt_in(
+            {
+                "GITHUB_ACTIONS": "true",
+                "OHHO_CI_SIM_ARMING": "1",
+                "OHHO_CI_SITL": "1",
+            }
+        )
+
+    def test_main_does_not_connect_on_actions_without_the_opt_in(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "CI": "true"}, clear=False):
+            os.environ.pop("OHHO_CI_SIM_ARMING", None)
+            os.environ.pop("OHHO_CI_SITL", None)
+            os.environ.pop("OHHO_ARM_HARDWARE", None)
+            with mock.patch.object(sitl_square, "connect_and_run") as connect:
+                code = sitl_square.main(["--uri", sitl_square.DEFAULT_URI])
         self.assertEqual(code, 1)
+        connect.assert_not_called()
+
+    def test_main_reaches_connect_when_actions_opted_in(self) -> None:
+        env = {
+            "GITHUB_ACTIONS": "true",
+            "CI": "true",
+            "OHHO_CI_SIM_ARMING": "1",
+            "OHHO_CI_SITL": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("OHHO_ARM_HARDWARE", None)
+            with mock.patch.object(
+                sitl_square,
+                "connect_and_run",
+                side_effect=sitl_square.MissionError("stopped in test"),
+            ) as connect:
+                code = sitl_square.main(["--uri", sitl_square.DEFAULT_URI])
+        self.assertEqual(code, 1)
+        connect.assert_called_once()
 
 
 class MissionTest(unittest.TestCase):
@@ -420,6 +481,8 @@ class PreflightReportTest(unittest.TestCase):
         self.assertIn("_human_tty_reason", ci)
         self.assertIn("_aerial_privileged", ci)
         self.assertIn("(ci)", ci)
+        self.assertIn("OHHO_CI_SIM_ARMING=1", ci)
+        self.assertIn("OHHO_CI_SITL=1", ci)
         self.assertNotIn("OHHO_ARM_HARDWARE=1", ci)
         other = sitl_square.flight_refusal("takeoff", "battery")
         self.assertEqual(other, "takeoff refused by SafetyGate: battery")
@@ -481,7 +544,8 @@ class WorkflowFileTest(unittest.TestCase):
         )
         self.assertNotIn("OHHO_ARM_HARDWARE=", text)
         self.assertNotIn("-e OHHO_ARM_HARDWARE", text)
-        self.assertIn("OHHO_ARM_HARDWARE:-", text)
+        self.assertIn("${OHHO_ARM_HARDWARE+x}", text)
+        self.assertNotIn("${OHHO_ARM_HARDWARE:-}", text)
         self.assertNotIn(":latest", text)
         self.assertNotIn("--arm", text)
         self.assertNotIn("--privileged", text)
@@ -553,9 +617,52 @@ class WorkflowFileTest(unittest.TestCase):
         )
         self.assertNotIn("PX4_PID=$!", script)
         self.assertNotIn("OHHO_ARM_HARDWARE=1", script)
+        self.assertIn("${OHHO_ARM_HARDWARE+x}", script)
+        self.assertNotIn("${OHHO_ARM_HARDWARE:-}", script)
+        self.assertIn('OHHO_OS_REF="${OHHO_OS_REF:-ohh-290-px4-dds}"', script)
+        self.assertIn("resolved ohho-os commit", script)
+        self.assertIn("export OHHO_CI_SIM_ARMING", script)
+        self.assertIn("export OHHO_CI_SITL", script)
+        self.assertNotIn("OHHO_CI_SIM_ARMING=1", script)
+        self.assertNotIn("OHHO_CI_SITL=1", script)
+        self.assertNotIn("OHHO_CI_SIM_ARMING:-", script)
+        self.assertNotIn("OHHO_CI_SITL:-", script)
         self.assertNotIn("--privileged", script)
         self.assertNotIn("--network host", script)
         self.assertNotIn("21196", script)
+
+    def test_sim_opt_in_is_only_on_the_fly_step_and_passed_into_docker(self) -> None:
+        text = (ROOT / ".github" / "workflows" / "sitl-px4.yml").read_text(encoding="utf-8")
+        self.assertIn("Refuse hardware arming", text)
+        _top, jobs = text.split("jobs:", 1)
+        workflow_env = text.split("env:", 1)[1].split("jobs:", 1)[0]
+        self.assertNotIn("OHHO_CI_SIM_ARMING", workflow_env)
+        self.assertNotIn("OHHO_CI_SITL", workflow_env)
+        criteria, square = jobs.split("  square:", 1)
+        self.assertNotIn("OHHO_CI_SIM_ARMING", criteria)
+        self.assertNotIn("OHHO_CI_SITL", criteria)
+        before_fly, fly = square.split("- name: Fly the square", 1)
+        self.assertNotIn("OHHO_CI_SIM_ARMING", before_fly)
+        self.assertNotIn("OHHO_CI_SITL", before_fly)
+        self.assertIn('${OHHO_ARM_HARDWARE+x}', before_fly)
+        for required in (
+            'OHHO_CI_SIM_ARMING: "1"',
+            'OHHO_CI_SITL: "1"',
+            '-e CI="${CI}"',
+            '-e GITHUB_ACTIONS="${GITHUB_ACTIONS}"',
+            '-e OHHO_CI_SIM_ARMING="${OHHO_CI_SIM_ARMING}"',
+            '-e OHHO_CI_SITL="${OHHO_CI_SITL}"',
+        ):
+            self.assertIn(required, fly, required)
+        self.assertLess(fly.index('-e CI="${CI}"'), fly.index('-e OHHO_CI_SIM_ARMING='))
+        self.assertLess(
+            fly.index('-e GITHUB_ACTIONS="${GITHUB_ACTIONS}"'),
+            fly.index('-e OHHO_CI_SIM_ARMING='),
+        )
+        self.assertLess(
+            fly.index('-e OHHO_CI_SIM_ARMING='),
+            fly.index('-e OHHO_CI_SITL='),
+        )
 
     def test_gcs_heartbeat_is_one_loopback_heartbeat_and_does_not_command(self) -> None:
         import socket
