@@ -341,8 +341,13 @@ class WorkflowFileTest(unittest.TestCase):
             "if: always()",
             "px4-console-tail.txt",
             "GITHUB_ACTIONS",
+            'sudo chown -R "$(id -u):$(id -g)" artifacts',
         ):
             self.assertIn(required, text, required)
+        self.assertLess(
+            text.index('sudo chown -R "$(id -u):$(id -g)" artifacts'),
+            text.index("artifacts/px4-console-tail.txt"),
+        )
         self.assertNotIn("OHHO_ARM_HARDWARE=", text)
         self.assertNotIn("-e OHHO_ARM_HARDWARE", text)
         self.assertIn("OHHO_ARM_HARDWARE:-", text)
@@ -370,11 +375,19 @@ class WorkflowFileTest(unittest.TestCase):
             "libunwind-dev",
             "protobuf-compiler",
             "install_px4_sim_deps",
+            "checkout_gz_models",
+            "submodule update --init -- Tools/simulation/gz",
+            "worlds/default.sdf",
+            "build gz_x500:",
         ):
             self.assertIn(required, script, required)
         self.assertLess(
             script.index("\ninstall_px4_sim_deps\n"),
             script.index("\nbuild_px4\n"),
+        )
+        self.assertLess(
+            script.index("\n  checkout_gz_models\n"),
+            script.index('make -C "$PX4_SRC" px4_sitl_default'),
         )
         self.assertLess(
             script.index("libopencv-dev"),

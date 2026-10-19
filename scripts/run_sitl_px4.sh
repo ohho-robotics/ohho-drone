@@ -169,9 +169,38 @@ build_px4_msgs() {
   )
 }
 
+checkout_gz_models() {
+  # v1.17.0 src/modules/simulation/gz_bridge/CMakeLists.txt globs
+  # Tools/simulation/gz/worlds/*.sdf while configuring, then adds ninja
+  # target gz_<model> for each airframe in the default world. That tree is
+  # the PX4-gazebo-models submodule. clone --depth 1 does not populate it,
+  # and px4_add_git_submodule only fetches it for the exclude-from-all `gz`
+  # target, which px4_sitl_default does not build. An empty worlds directory
+  # means cmake emits no gz_x500 target (the failure on run 39294116216).
+  log "checking out PX4 Gazebo models"
+  git -C "$PX4_SRC" submodule update --init -- Tools/simulation/gz
+  local recorded head
+  recorded="$(git -C "$PX4_SRC" rev-parse "HEAD:Tools/simulation/gz")"
+  head="$(git -C "$PX4_SRC/Tools/simulation/gz" rev-parse HEAD)"
+  if [ "$recorded" != "$head" ]; then
+    echo "Gazebo models checkout is ${head}, expected ${recorded}" >&2
+    exit 1
+  fi
+  if [ ! -f "$PX4_SRC/Tools/simulation/gz/worlds/default.sdf" ]; then
+    echo "Gazebo world worlds/default.sdf is missing; gz_x500 cannot be generated" >&2
+    exit 1
+  fi
+  local build_dir="$PX4_SRC/build/px4_sitl_default"
+  if [ -f "$build_dir/build.ninja" ] && ! grep -q 'build gz_x500:' "$build_dir/build.ninja"; then
+    log "dropping PX4 build configured before Gazebo worlds were present"
+    rm -rf "$build_dir"
+  fi
+}
+
 build_px4() {
   log "building PX4 ${PX4_GIT_REF} SITL"
   clone_ref "$PX4_SRC" "$PX4_REPO" "$PX4_GIT_REF" tag
+  checkout_gz_models
   make -C "$PX4_SRC" px4_sitl_default
 }
 

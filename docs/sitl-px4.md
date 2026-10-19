@@ -35,6 +35,15 @@ on Ubuntu 24.04, so it does not contain Gazebo, OpenCV, or the SITL binary.
 on Ubuntu 24.04, plus Eigen, unwind, pkg-config, and protobuf), and builds
 the `v1.17.0` tag inside that image.
 
+`gz_bridge/CMakeLists.txt` in that tag adds the `gz_x500` ninja target only
+when `Tools/simulation/gz/worlds/*.sdf` exists during configure. That path is
+the `PX4-gazebo-models` submodule (`worlds/default.sdf` and `models/x500`).
+A depth-1 clone leaves it empty, and PX4 fetches it only for an
+exclude-from-all `gz` target that `px4_sitl_default` does not build, so the
+firmware links and `ninja` still has no `gz_x500` target. The script checks
+that submodule out to the gitlink recorded by tag `v1.17.0` and refuses to
+configure when `worlds/default.sdf` is missing.
+
 The plan's budget for a prebuilt image is 20 minutes cold and 8 minutes warm.
 The workflow's hard timeout is 40 minutes so the first compile can finish and
 be compared with that budget. The image cache key is the index digest above.
@@ -114,10 +123,10 @@ flight.
 
 Confirm the image digest is the index or amd64 digest in the table before
 trusting a retag of `v1.17.0`. `scripts/run_sitl_px4.sh` checks out PX4
-`v1.17.0`, installs the simulation packages above, builds `px4_sitl_default`,
-starts `MicroXRCEAgent udp4 -p 8888`, then runs `HEADLESS=1
-PX4_SIM_MODEL=gz_x500 PX4_SIM_SPEED_FACTOR=1 make px4_sitl gz_x500`. The Ohho
-process is `scripts/sitl_square.py`.
+`v1.17.0`, installs the simulation packages above, checks out the Gazebo
+models submodule, builds `px4_sitl_default`, starts `MicroXRCEAgent udp4 -p
+8888`, then runs `HEADLESS=1 PX4_SIM_MODEL=gz_x500 PX4_SIM_SPEED_FACTOR=1
+make px4_sitl gz_x500`. The Ohho process is `scripts/sitl_square.py`.
 
 Mission rules without a simulator:
 
@@ -127,7 +136,10 @@ python -m unittest discover -s tests -v
 
 ## Artifacts
 
-Pass or fail, the workflow uploads `artifacts/`:
+Pass or fail, the workflow uploads `artifacts/`. The container writes that
+directory as root. After `docker rm`, the workflow runs `sudo chown -R` so
+the runner can replace `px4-console-tail.txt` and the upload can read the
+files.
 
 - `px4-console.log` and `px4-console-tail.txt` (last 200 lines)
 - `xrce-agent.log`

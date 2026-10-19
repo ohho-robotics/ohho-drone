@@ -108,14 +108,18 @@ jobs:
             -lc 'sleep infinity'
           docker exec ohho-px4 bash /opt/ohho-drone/scripts/run_sitl_px4.sh
 
+      # The container writes /artifacts as root. After it exits, give those
+      # files to the runner before rewriting the tail or uploading them.
       - name: Keep the PX4 console tail
         if: always()
         run: |
+          set -euo pipefail
+          docker rm -f ohho-px4 >/dev/null 2>&1 || true
           mkdir -p artifacts
+          sudo chown -R "$(id -u):$(id -g)" artifacts
           if [ -f artifacts/px4-console.log ]; then
             tail -n 200 artifacts/px4-console.log > artifacts/px4-console-tail.txt
           fi
-          docker rm -f ohho-px4 >/dev/null 2>&1 || true
 
       - name: Upload logs and ulog
         if: always()
