@@ -9,6 +9,13 @@ exactly ``1``. That opt-in does not bypass the gate.
 
 Nothing in this module imports Ohho at import time, so the mission rules can
 be tested without ROS or the simulator.
+
+A failsafe flag that is already set at arm time is recorded and does not fail
+the run by itself. Headless SITL has no RC, so ``rc_loss`` is that flag. A
+flag that rises after takeoff and before the land command fails the run, as
+does ``offboard_loss`` during the takeoff hold or the square. A flag that
+rises only after the land command is recorded and does not fail. Landing
+stops the offboard stream, so that loss is expected.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import re
 import sys
 import time
 import urllib.parse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
 # Plan section 3. These are the pass/fail numbers, not tuning guesses.
@@ -62,6 +69,18 @@ _PREFLIGHT_FAIL = re.compile(r"Preflight Fail:\s*(.+)")
 # SafetyGate._human_tty_reason. ci is CI without OHHO_CI_SIM_ARMING=1 and
 # OHHO_CI_SITL=1; no_tty is a headless caller outside that sim-only opt-in.
 HUMAN_TTY_REASONS = frozenset({"ci", "no_tty"})
+# ohho-os maps FailsafeFlags.offboard_control_signal_lost to this name.
+OFFBOARD_LOSS_FLAG = "offboard_loss"
+# PX4 v1.17 commander failsafe modeFromAction, as ohho-os flight_mode strings
+# (_NAV_NAMES in adapters/px4_dds.py). These are not normal phases of this
+# script. auto_land is also what land() commands, so it is allowed only then.
+_FAILSAFE_NAV_ALWAYS = frozenset({"auto_rtl", "descend", "termination"})
+# Hold and the position/altitude/stabilized fallbacks. PX4 leaves multicopter
+# takeoff by completing the mode into Hold, so auto_loiter during takeoff is
+# not treated as a failsafe. It is one after the square has entered offboard.
+_FAILSAFE_NAV_AFTER_OFFBOARD = frozenset(
+    {"auto_loiter", "posctl", "altctl", "stabilized"}
+)
 
 
 class MissionError(RuntimeError):
@@ -82,6 +101,11 @@ class DroneSample:
     link_ok: bool
     battery: Optional[float]
     prearm: Optional[bool]
+    # ohho-os drone["flight_mode"], the vehicle_status.nav_state name.
+    flight_mode: Optional[str] = None
+    # vehicle_status.failsafe when telemetry carries it. ohh-290-px4-dds does
+    # not, so this stays None on the live path and nav_state is used instead.
+    vehicle_failsafe: Optional[bool] = None
 
 
 @dataclass
@@ -98,6 +122,8 @@ class MissionResult:
     armed: Optional[bool]
     takeoff_held: bool
     preflight_failures: list[str]
+    preexisting_failsafe_flags: list[str] = field(default_factory=list)
+    post_land_flags: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -423,7 +449,18 @@ class _Mission:
         self.phases: list[str] = []
         self.reasons: list[str] = []
         self.failsafes: list[str] = []
-        self._record_failsafe = False
+        self.preexisting_failsafe_flags: list[str] = []
+        self.post_land_flags: list[str] = []
+        self._monitor_failsafe = False
+        self._have_failsafe_baseline = False
+        self._flag_window = False
+        self._offboard_phase = False
+        self._square_phase = False
+        self._saw_offboard_in_square = False
+        self._land_commanded = False
+        self._prev_flags: set[str] = set()
+        self._vehicle_failsafe_tripped = False
+        self._nav_failsafe_modes: list[str] = []
         self.sample = DroneSample(
             None, None, None, None, None, "unknown", (), False, None, None
         )
@@ -440,11 +477,71 @@ class _Mission:
 
     def _note_sample(self, sample: DroneSample) -> None:
         self.sample = sample
-        if self._record_failsafe:
-            for flag in sample.failsafe:
-                if flag not in self.failsafes:
+        if not self._monitor_failsafe:
+            return
+        flags = _flag_names(sample.failsafe)
+        if not self._have_failsafe_baseline:
+            self.preexisting_failsafe_flags = list(flags)
+            self._prev_flags = set(flags)
+            self._have_failsafe_baseline = True
+            self._check_escalation(sample)
+            return
+        self._check_escalation(sample)
+        self._check_flag_edges(flags)
+        self._prev_flags = set(flags)
+
+    def _check_escalation(self, sample: DroneSample) -> None:
+        if sample.vehicle_failsafe is True:
+            self._vehicle_failsafe_tripped = True
+        self._check_nav(sample.flight_mode)
+
+    def _check_nav(self, mode: Optional[str]) -> None:
+        if not isinstance(mode, str):
+            return
+        name = mode.strip().lower()
+        if not name or name == "unknown":
+            return
+        if name == "offboard" and self._square_phase:
+            self._saw_offboard_in_square = True
+        if name == "auto_land" and self._land_commanded:
+            return
+        if name in _FAILSAFE_NAV_ALWAYS or name == "auto_land":
+            self._record_nav(name)
+            return
+        if (
+            name in _FAILSAFE_NAV_AFTER_OFFBOARD
+            and self._square_phase
+            and self._saw_offboard_in_square
+            and not self._land_commanded
+        ):
+            self._record_nav(name)
+
+    def _record_nav(self, name: str) -> None:
+        if name in self._nav_failsafe_modes:
+            return
+        self._nav_failsafe_modes.append(name)
+        self.log(f"nav_state failsafe mode {name}")
+
+    def _check_flag_edges(self, flags: tuple[str, ...]) -> None:
+        if self._flag_window:
+            for flag in flags:
+                if flag not in self._prev_flags and flag not in self.failsafes:
                     self.failsafes.append(flag)
                     self.log(f"failsafe flag after takeoff: {flag}")
+            if (
+                self._offboard_phase
+                and OFFBOARD_LOSS_FLAG in flags
+                and OFFBOARD_LOSS_FLAG not in self.failsafes
+            ):
+                self.failsafes.append(OFFBOARD_LOSS_FLAG)
+                self.log("offboard_loss during offboard flight")
+            return
+        if not self._land_commanded:
+            return
+        for flag in flags:
+            if flag not in self._prev_flags and flag not in self.post_land_flags:
+                self.post_land_flags.append(flag)
+                self.log(f"failsafe flag after land command: {flag}")
 
     def _advance(self, period_s: float) -> None:
         before = self.clock()
@@ -503,16 +600,29 @@ class _Mission:
 
     def finish(self) -> MissionResult:
         if self._took_off and not self.vehicle.latched():
+            # Close the in-flight window before land() so a flag the land
+            # command itself causes is post-land, not an in-flight failure.
+            self._flag_window = False
+            self._offboard_phase = False
+            self._square_phase = False
+            self._land_commanded = True
             self.phase("land")
             self.call("land", self.vehicle.land)
             self._wait_landed()
         reasons = list(self.reasons)
-        if self._record_failsafe and self.failsafes:
+        if self.failsafes:
             reasons.append(
                 "failsafe after takeoff: " + ", ".join(self.failsafes)
             )
+        if self._vehicle_failsafe_tripped:
+            reasons.append("vehicle_status.failsafe became true after arming")
+        if self._nav_failsafe_modes:
+            reasons.append(
+                "nav_state changed to a failsafe mode not commanded by the script: "
+                + ", ".join(self._nav_failsafe_modes)
+            )
         if self._took_off and not self.takeoff_held:
-            if not any("takeoff" in reason for reason in reasons):
+            if not any("takeoff altitude was not inside" in reason for reason in reasons):
                 reasons.append(
                     f"takeoff altitude was not inside {ALT_TOLERANCE_M} m "
                     f"for {ALT_HOLD_S} s"
@@ -553,6 +663,8 @@ class _Mission:
             armed=self.sample.armed,
             takeoff_held=self.takeoff_held,
             preflight_failures=list(self.preflight_failures),
+            preexisting_failsafe_flags=list(self.preexisting_failsafe_flags),
+            post_land_flags=list(self.post_land_flags),
         )
 
     def _wait_landed(self) -> None:
@@ -613,17 +725,26 @@ class _Mission:
                 return self.finish()
             if not self.call("arm_flight", self.vehicle.arm_flight):
                 return self.finish()
+            self._monitor_failsafe = True
+            self.read()
 
             self.phase("takeoff")
             if not self.call("takeoff", lambda: self.vehicle.takeoff(TAKEOFF_ALT_M)):
                 return self.finish()
             self._took_off = True
+            # A clear-to-set flag counts from here until the land command.
+            # offboard_loss also fails once the takeoff hold starts, and
+            # through the square. The climb before the hold is only the
+            # transition rule.
+            self._flag_window = True
 
             def held() -> bool:
                 ok, since = altitude_held(
                     self.sample.z, self.hold_since, self.clock()
                 )
                 self.hold_since = since
+                if since is not None:
+                    self._offboard_phase = True
                 return ok
 
             # Position setpoints are not streamed here. A setpoint would switch
@@ -635,10 +756,10 @@ class _Mission:
                 )
                 return self.finish()
             self.takeoff_held = True
-            self._record_failsafe = True
-            self._note_sample(self.sample)
 
             self.phase("square")
+            self._square_phase = True
+            self._offboard_phase = True
             self._fly_square()
             return self.finish()
         except MissionError as exc:
@@ -792,6 +913,8 @@ class OhhoVehicle:
             link_ok=drone.get("link_ok") is True,
             battery=_battery(tele, drone),
             prearm=_prearm(self.robot),
+            flight_mode=_flight_mode_name(drone),
+            vehicle_failsafe=_vehicle_failsafe_bit(drone),
         )
 
     def arm_gate(self) -> bool:
@@ -843,6 +966,36 @@ class OhhoVehicle:
         error = getattr(gate, "last_error", None)
         if error:
             raise MissionError(flight_refusal(label, str(error)))
+
+
+def _flag_names(flags: Sequence[object]) -> tuple[str, ...]:
+    """Failsafe names in first-seen order, without empties or duplicates."""
+    names: list[str] = []
+    for flag in flags:
+        text = str(flag).strip()
+        if text and text not in names:
+            names.append(text)
+    return tuple(names)
+
+
+def _flight_mode_name(drone: dict[str, Any]) -> Optional[str]:
+    """``drone["flight_mode"]`` when ohho-os sent a nav_state name."""
+    mode = drone.get("flight_mode")
+    if isinstance(mode, str) and mode.strip():
+        return mode.strip()
+    return None
+
+
+def _vehicle_failsafe_bit(drone: dict[str, Any]) -> Optional[bool]:
+    """``vehicle_status.failsafe`` when telemetry carries the bool.
+
+    ohho-os ``ohh-290-px4-dds`` does not put that bit in ``custom["drone"]``.
+    Missing means unknown, not false. Nav-state escalation covers that path.
+    """
+    value = drone.get("vehicle_failsafe")
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def _finite(value: Any) -> Optional[float]:

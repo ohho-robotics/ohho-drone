@@ -41,6 +41,8 @@ class FakeVehicle:
         self.link_ok = True
         self.prearm: bool | None = True
         self.failsafe: tuple[str, ...] = ()
+        self.flight_mode: str | None = None
+        self.vehicle_failsafe: bool | None = False
         self.gate_armed = False
         self.target: tuple[float, float, float] | None = None
         self.takeoff_cmd = False
@@ -60,6 +62,8 @@ class FakeVehicle:
             link_ok=self.link_ok,
             battery=self.battery,
             prearm=self.prearm,
+            flight_mode=self.flight_mode,
+            vehicle_failsafe=self.vehicle_failsafe,
         )
 
     def step(self) -> None:
@@ -343,6 +347,9 @@ class MissionTest(unittest.TestCase):
         self.assertEqual(takeoffs, [("takeoff", 2.5)])
         self.assertIn("square", result.phases)
         self.assertEqual(result.preflight_failures, [])
+        self.assertEqual(result.failsafes, [])
+        self.assertEqual(result.preexisting_failsafe_flags, [])
+        self.assertEqual(result.post_land_flags, [])
         self.assertEqual(result.to_json()["criteria"]["square_side_m"], 4.0)
 
     def test_gate_arm_refusal_does_not_take_off(self) -> None:
@@ -362,14 +369,188 @@ class MissionTest(unittest.TestCase):
         self.assertTrue(any("corner 1" in reason for reason in result.reasons))
         self.assertIn("land", _names(vehicle))
 
-    def test_failsafe_after_takeoff_fails_the_run(self) -> None:
+    def test_preexisting_rc_loss_with_failsafe_clear_passes(self) -> None:
+        """Headless SITL has no RC. The flag is set before arm and never rises."""
         vehicle = FakeVehicle()
         vehicle.failsafe = ("rc_loss",)
+        vehicle.vehicle_failsafe = False
+        result = _run(vehicle)
+        self.assertTrue(result.passed, result.reasons)
+        self.assertEqual(result.preexisting_failsafe_flags, ["rc_loss"])
+        self.assertEqual(result.failsafes, [])
+        self.assertEqual(result.post_land_flags, [])
+        self.assertNotIn("rc_loss", " ".join(result.reasons))
+        payload = result.to_json()
+        self.assertEqual(payload["preexisting_failsafe_flags"], ["rc_loss"])
+        self.assertEqual(payload["post_land_flags"], [])
+
+    def test_preexisting_flag_that_rises_again_fails(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.failsafe = ("rc_loss",)
+        cleared = False
+
+        def step() -> None:
+            nonlocal cleared
+            FakeVehicle.step(vehicle)
+            target = vehicle.target
+            moved = target is not None and (target[0] != 0.0 or target[1] != 0.0)
+            if vehicle.landing:
+                return
+            if vehicle.landed == "in_air" and not cleared:
+                vehicle.failsafe = ()
+                cleared = True
+            elif cleared and moved:
+                vehicle.failsafe = ("rc_loss",)
+
+        vehicle.step = step  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.preexisting_failsafe_flags, ["rc_loss"])
+        self.assertIn("rc_loss", result.failsafes)
+
+    def test_failsafe_after_takeoff_fails_the_run(self) -> None:
+        vehicle = FakeVehicle()
+
+        def step() -> None:
+            FakeVehicle.step(vehicle)
+            if vehicle.landed == "in_air" and not vehicle.landing:
+                vehicle.failsafe = ("rc_loss",)
+
+        vehicle.step = step  # type: ignore[method-assign]
         result = _run(vehicle)
         self.assertFalse(result.passed)
         self.assertEqual(result.failsafes, ["rc_loss"])
+        self.assertEqual(result.preexisting_failsafe_flags, [])
         self.assertTrue(any("failsafe" in reason for reason in result.reasons))
         self.assertIn("land", _names(vehicle))
+
+    def test_offboard_loss_during_square_fails_the_run(self) -> None:
+        vehicle = FakeVehicle()
+
+        def step() -> None:
+            FakeVehicle.step(vehicle)
+            target = vehicle.target
+            if (
+                target is not None
+                and (target[0] != 0.0 or target[1] != 0.0)
+                and not vehicle.landing
+            ):
+                vehicle.failsafe = ("offboard_loss",)
+
+        vehicle.step = step  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.failsafes, ["offboard_loss"])
+        self.assertEqual(result.preexisting_failsafe_flags, [])
+        self.assertEqual(result.post_land_flags, [])
+        self.assertIn("land", _names(vehicle))
+
+    def test_preexisting_offboard_loss_still_fails_during_the_square(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.failsafe = ("offboard_loss",)
+        vehicle.vehicle_failsafe = False
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.preexisting_failsafe_flags, ["offboard_loss"])
+        self.assertIn("offboard_loss", result.failsafes)
+        self.assertTrue(any("failsafe after takeoff" in reason for reason in result.reasons))
+
+    def test_offboard_loss_after_commanded_land_is_recorded_and_passes(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.flight_mode = "offboard"
+        vehicle.vehicle_failsafe = False
+
+        def land() -> None:
+            vehicle.calls.append("land")
+            vehicle.landing = True
+            vehicle.failsafe = ("offboard_loss",)
+            vehicle.flight_mode = "auto_land"
+
+        vehicle.land = land  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertTrue(result.passed, result.reasons)
+        self.assertEqual(result.failsafes, [])
+        self.assertEqual(result.post_land_flags, ["offboard_loss"])
+        self.assertEqual(result.preexisting_failsafe_flags, [])
+        self.assertTrue(result.takeoff_held)
+
+    def test_vehicle_status_failsafe_true_fails_the_run(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.vehicle_failsafe = True
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any(
+                "vehicle_status.failsafe became true after arming" in reason
+                for reason in result.reasons
+            )
+        )
+        self.assertIn("land", _names(vehicle))
+
+    def test_nav_state_rtl_after_arming_fails_the_run(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.flight_mode = "offboard"
+
+        def step() -> None:
+            FakeVehicle.step(vehicle)
+            if vehicle.landed == "in_air" and not vehicle.landing:
+                vehicle.flight_mode = "auto_rtl"
+
+        vehicle.step = step  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("auto_rtl" in reason and "failsafe" in reason for reason in result.reasons)
+        )
+        self.assertIn("land", _names(vehicle))
+
+    def test_hold_after_takeoff_is_not_a_failsafe(self) -> None:
+        """PX4 completes multicopter takeoff into Hold. That is not an escalation."""
+        vehicle = FakeVehicle()
+        vehicle.flight_mode = "auto_takeoff"
+        left_origin = False
+
+        def step() -> None:
+            nonlocal left_origin
+            FakeVehicle.step(vehicle)
+            if vehicle.landing:
+                return
+            target = vehicle.target
+            moved = target is not None and (target[0] != 0.0 or target[1] != 0.0)
+            if moved:
+                left_origin = True
+                vehicle.flight_mode = "offboard"
+            elif vehicle.takeoff_cmd and not left_origin:
+                vehicle.flight_mode = "auto_loiter"
+
+        def land() -> None:
+            vehicle.calls.append("land")
+            vehicle.landing = True
+            vehicle.flight_mode = "auto_land"
+
+        vehicle.step = step  # type: ignore[method-assign]
+        vehicle.land = land  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertTrue(result.passed, result.reasons)
+
+    def test_hold_after_square_offboard_fails_the_run(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.flight_mode = "offboard"
+
+        def step() -> None:
+            FakeVehicle.step(vehicle)
+            target = vehicle.target
+            if (
+                target is not None
+                and (target[0] != 0.0 or target[1] != 0.0)
+                and not vehicle.landing
+            ):
+                vehicle.flight_mode = "auto_loiter"
+
+        vehicle.step = step  # type: ignore[method-assign]
+        result = _run(vehicle)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("auto_loiter" in reason for reason in result.reasons))
 
     def test_disarm_is_not_sent_while_airborne(self) -> None:
         vehicle = FakeVehicle()
@@ -506,6 +687,38 @@ class PreflightReportTest(unittest.TestCase):
             vehicle.arm_flight()
         self.assertIn("_human_tty_reason", str(caught.exception))
         self.assertIn("(ci)", str(caught.exception))
+
+    def test_ohho_snapshot_reads_flight_mode_and_leaves_a_missing_failsafe_bit(self) -> None:
+        class Telemetry:
+            def __init__(self, drone: dict[str, object]) -> None:
+                self.custom = {"drone": drone}
+                self.battery = 0.8
+
+        class Robot:
+            def __init__(self, drone: dict[str, object]) -> None:
+                self.transport = object()
+                self._drone = drone
+
+            def telemetry(self) -> Telemetry:
+                return Telemetry(self._drone)
+
+        drone = {
+            "pose": {"x": 1.0, "y": 2.0, "z": -2.5},
+            "pose_frame": "LOCAL_NED",
+            "armed": True,
+            "landed_state": "in_air",
+            "failsafe": ["rc_loss"],
+            "flight_mode": "offboard",
+            "link_ok": True,
+            "battery": 0.9,
+        }
+        sample = sitl_square.OhhoVehicle(Robot(drone)).snapshot()
+        self.assertEqual(sample.failsafe, ("rc_loss",))
+        self.assertEqual(sample.flight_mode, "offboard")
+        self.assertIsNone(sample.vehicle_failsafe)
+        drone["vehicle_failsafe"] = True
+        exposed = sitl_square.OhhoVehicle(Robot(drone)).snapshot()
+        self.assertIs(exposed.vehicle_failsafe, True)
 
 
 class WorkflowFileTest(unittest.TestCase):

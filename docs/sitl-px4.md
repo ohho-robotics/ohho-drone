@@ -91,11 +91,26 @@ The job fails unless all of these are true:
   Each corner is accepted only when the horizontal error is within 0.8 m and
   the same 0.4 m altitude band still holds.
 - The run ends with `landed_state == on_ground` and the motors disarmed.
-- No failsafe flag (`offboard_loss`, `rc_loss`, `geofence`, `battery`,
-  `datalink`) is set after the takeoff hold.
+- A failsafe flag that is already set at arm time is recorded in
+  `preexisting_failsafe_flags` and does not fail the run by itself.
+  Headless SITL keeps `manual_control_signal_lost` set, which ohho-os
+  reports as `rc_loss`, and PX4 still arms.
+- A flag that changes from clear to set after takeoff and before the land
+  command fails the run. `offboard_loss` also fails if it is set on any
+  sample during the takeoff hold or the square.
+- A flag that rises only after the land command is recorded in
+  `post_land_flags` and does not fail. Landing stops the offboard stream,
+  so `offboard_loss` after that command is expected.
+- After arming, `vehicle_status.failsafe` true fails the run when that bit
+  is in telemetry. ohho-os `ohh-290-px4-dds` does not publish it. Until it
+  does, `flight_mode` (the `nav_state` name) fails the run on `auto_rtl`,
+  `descend`, `termination`, or `auto_land` before the land command.
+  `auto_loiter` while takeoff is finishing is PX4 exiting into Hold.
+  `auto_loiter` after the square has entered offboard fails. `auto_land`
+  after the land command does not.
 
-A timeout, a missed corner, a missing disarm, or a failsafe flag fails the
-run. The script does not change PX4 failsafe parameters.
+A timeout, a missed corner, a missing disarm, or one of those failsafe
+conditions fails the run. The script does not change PX4 failsafe parameters.
 
 Disarm is a normal disarm, and only after the vehicle is on the ground with
 height at or below 0.25 m. The script never sends force-disarm and never sends
@@ -188,8 +203,9 @@ files.
   256 KiB, so a newline-free prompt cannot copy the whole console)
 - `xrce-agent.log`
 - `gcs-heartbeat.log`
-- `sitl-result.json` (criteria, phases, corner errors, failsafes, duration,
-  and `preflight_failures` when the status wait times out)
+- `sitl-result.json` (criteria, phases, corner errors, failsafes,
+  `preexisting_failsafe_flags`, `post_land_flags`, duration, and
+  `preflight_failures` when the status wait times out)
 - any `*.ulg` logs the PX4 build wrote
 
 `duration_s` in `sitl-result.json` is only the mission clock after
