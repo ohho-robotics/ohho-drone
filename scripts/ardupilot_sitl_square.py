@@ -35,6 +35,37 @@ OHHO_PIP_URL = (
     "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os"
     "@ohh-305-mavlink-backend"
 )
+# Copter-4.7.2 Tools/environment_install/install-prereqs-ubuntu.sh
+# (fb773567896014da007bca58358704d4a0d8516f).
+# Packages that ./waf copter and headless sim_vehicle.py import, using
+# that script's names. empy==3.3.4 is the only pin. pexpect is only the
+# apt package python3-pexpect there. The prereqs script creates
+# ~/venv-ardupilot from whichever python3 is first on PATH. After
+# actions/setup-python that is not Ubuntu's interpreter, so the venv
+# cannot import the apt module. Tools/AP_Periph/wscript then aborts
+# ./waf copter on `import pexpect`.
+# sim_vehicle.py imports it through Tools/autotest/pysim/util.py.
+# numpy, pyparsing, and psutil are what the script pip-installs when it
+# creates that venv. intelhex is from the default extra list.
+# `future` is not in this tag's prereqs and not in the pinned pymavlink
+# install_requires. MAVProxy, geocoder, tabulate, flake8, junitparser,
+# wsproto, and pygame are in the script but not on this import path.
+# sim_vehicle.py is started with --no-mavproxy. Current MAVProxy also
+# depends on vtk, matplotlib, and opencv-python, which this job does not
+# import. install-prereqs-ubuntu.sh still installs those itself.
+ARDUPILOT_VENV_PIP_PACKAGES = (
+    "lxml",
+    "pymavlink",
+    "pyserial",
+    "empy==3.3.4",
+    "pexpect",
+    "ptyprocess",
+    "dronecan",
+    "intelhex",
+    "numpy",
+    "pyparsing",
+    "psutil",
+)
 ROBOT_ID = "px4-sitl"
 
 TAKEOFF_ALT_M = 2.5

@@ -58,6 +58,37 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("--arm", self.text)
         self.assertIn("OHHO_ARM_HARDWARE+x", self.text)
 
+    def test_venv_packages_match_copter_4_7_2_prereqs(self) -> None:
+        expected = (
+            "lxml",
+            "pymavlink",
+            "pyserial",
+            "empy==3.3.4",
+            "pexpect",
+            "ptyprocess",
+            "dronecan",
+            "intelhex",
+            "numpy",
+            "pyparsing",
+            "psutil",
+        )
+        self.assertEqual(square.ARDUPILOT_VENV_PIP_PACKAGES, expected)
+        self.assertNotIn("future", square.ARDUPILOT_VENV_PIP_PACKAGES)
+        prereq = self.text.index("Install SITL prerequisites")
+        venv = self.text.index("Install ArduPilot venv Python packages")
+        build = self.text.index("Build ArduCopter SITL")
+        self.assertLess(prereq, venv)
+        self.assertLess(venv, build)
+        step = self.text[venv:build]
+        self.assertIn('venv_python="${HOME}/venv-ardupilot/bin/python3"', step)
+        self.assertIn("ARDUPILOT_VENV_PIP_PACKAGES", step)
+        self.assertIn('"${venv_python}" -m pip install', step)
+        self.assertIn("import em", step)
+        self.assertIn("import pexpect", step)
+        self.assertIn("from pymavlink import mavextra", step)
+        for skipped in ("wxpython", "matplotlib", "opencv-python", "pygame"):
+            self.assertNotIn(skipped, step)
+
 
 if __name__ == "__main__":
     unittest.main()

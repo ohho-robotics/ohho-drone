@@ -101,6 +101,27 @@ jobs:
           set -euo pipefail
           Tools/environment_install/install-prereqs-ubuntu.sh -y
 
+      - name: Install ArduPilot venv Python packages
+        run: |
+          set -euo pipefail
+          if [ -f "${HOME}/.profile" ]; then
+            # shellcheck disable=SC1090,SC1091
+            source "${HOME}/.profile"
+          fi
+          venv_python="${HOME}/venv-ardupilot/bin/python3"
+          if [ ! -x "${venv_python}" ]; then
+            echo "ArduPilot venv python is missing: ${venv_python}" >&2
+            exit 1
+          fi
+          # Package names and the empy pin live in ARDUPILOT_VENV_PIP_PACKAGES.
+          # Install with the venv interpreter. A bare python3 here is the
+          # setup-python toolcache, which cannot see apt's python3-pexpect.
+          mapfile -t packages < <(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import ardupilot_sitl_square as square; print("\n".join(square.ARDUPILOT_VENV_PIP_PACKAGES))' "${GITHUB_WORKSPACE}/scripts")
+          for package in "${packages[@]}"; do
+            "${venv_python}" -m pip install --upgrade --progress-bar off "${package}"
+          done
+          "${venv_python}" -c "import em; import pexpect; from pymavlink import mavextra; import lxml, serial, psutil, numpy, pyparsing, intelhex, dronecan"
+
       - name: Build ArduCopter SITL
         working-directory: ardupilot
         run: |
