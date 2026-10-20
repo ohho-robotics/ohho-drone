@@ -1,0 +1,2 @@
+# Headless PX4 SITL GCS heartbeat. The version is pinned; do not float it.
+pymavlink==2.4.50
