@@ -606,6 +606,89 @@ class ArmReadinessTests(unittest.TestCase):
         self.assertNotIn("disarm", vehicle.calls)
 
 
+class _PositionGateVehicle(FakeVehicle):
+    """Reports ``position_fed`` the way ``OhhoVehicle`` does."""
+
+    def __init__(self, *, ready_on_read: int) -> None:
+        super().__init__()
+        self.ready_on_read = ready_on_read
+        self.reads = 0
+        self._position_fed = False
+
+    @property
+    def position_fed(self) -> bool:
+        return self._position_fed
+
+    def read(self) -> square.VehicleSample:
+        self.reads += 1
+        self._position_fed = self.reads >= self.ready_on_read
+        return super().read()
+
+
+class _RefuseGateArm(FakeVehicle):
+    def __init__(self, *, autopilot_armed: bool) -> None:
+        super().__init__()
+        self.armed = autopilot_armed
+
+    def arm_gate(self) -> None:
+        self.calls.append("arm_gate")
+        raise square.SquareFailed(
+            "SafetyGate.arm() refused the gate: no_fresh_state"
+        )
+
+
+class ArmFailurePathTests(unittest.TestCase):
+    def test_arm_waits_until_a_new_position_sample_is_fed(self) -> None:
+        vehicle = _PositionGateVehicle(ready_on_read=3)
+        clock = FakeClock()
+        report, _text, caught = ArmReadinessTests()._fly(vehicle, clock)
+        self.assertIsNone(caught)
+        assert report is not None
+        self.assertTrue(report.passed)
+        self.assertGreaterEqual(vehicle.reads, 3)
+        self.assertIn("arm_gate", vehicle.calls)
+        self.assertGreaterEqual(clock.t, 1.0 / square.STREAM_HZ)
+
+    def test_missing_position_sample_fails_inside_the_arm_timeout(self) -> None:
+        vehicle = _PositionGateVehicle(ready_on_read=10**9)
+        clock = FakeClock()
+        _report, text, caught = ArmReadinessTests()._fly(
+            vehicle, clock, arm_timeout_s=0.25
+        )
+        assert caught is not None
+        self.assertIn(square._FRESH_POSITION_BLOCKER, str(caught))
+        self.assertIn("not armable", text)
+        self.assertNotIn("arm_gate", vehicle.calls)
+        payload = square._failure_payload(caught, clock.t)
+        self.assertIn(square._FRESH_POSITION_BLOCKER, str(payload["message"]))
+
+    def test_disarmed_gate_arm_refusal_does_not_land(self) -> None:
+        vehicle = _RefuseGateArm(autopilot_armed=False)
+        clock = FakeClock()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(square.SquareFailed) as caught:
+                square.fly_square(vehicle, sleep=clock.sleep, monotonic=clock)
+        self.assertIn("SafetyGate.arm() refused the gate", str(caught.exception))
+        self.assertIn("no_fresh_state", str(caught.exception))
+        self.assertNotIn("land", vehicle.calls)
+        self.assertIn("arm_gate", vehicle.calls)
+        self.assertIn("not landing", err.getvalue())
+        self.assertIn("safety gate arm was refused", err.getvalue())
+        payload = square._failure_payload(caught.exception, 40.212)
+        self.assertFalse(payload["passed"])
+        self.assertTrue(payload["attempted"])
+        self.assertIn("no_fresh_state", str(payload["message"]))
+
+    def test_gate_arm_refusal_still_lands_when_the_autopilot_is_armed(self) -> None:
+        vehicle = _RefuseGateArm(autopilot_armed=True)
+        clock = FakeClock()
+        with self.assertRaises(square.SquareFailed):
+            square.fly_square(vehicle, sleep=clock.sleep, monotonic=clock)
+        self.assertIn("land", vehicle.calls)
+        self.assertNotIn("disarm", vehicle.calls)
+
+
 class _DirectMessage:
     def __init__(self, message_name: str, fields: dict[str, object]) -> None:
         self.message_name = message_name
@@ -740,6 +823,8 @@ class HealthWatchTests(unittest.TestCase):
                 "SYS_STATUS",
                 "GPS_RAW_INT",
                 "EKF_STATUS_REPORT",
+                "LOCAL_POSITION_NED",
+                "ATTITUDE",
                 "HEARTBEAT",
                 "EXTENDED_SYS_STATE",
                 "COMMAND_ACK",
@@ -1017,6 +1102,67 @@ class HealthWatchTests(unittest.TestCase):
         self.assertEqual(watch.interval_ack_note, accepted_note)
         vehicle.close()
         self.assertTrue(direct.destroyed)
+
+    def test_local_position_is_emitted_once_and_a_heartbeat_is_not(self) -> None:
+        robot, _action = self._robot()
+        direct = _Direct(object())
+        watch = self._attach(robot, direct)
+        inner = _FeedInner()
+        robot.transport = type("Gate", (), {"_inner": inner})()
+        vehicle = square.OhhoVehicle(robot, object(), health=watch)
+        by_name = {name: callback for name, callback in direct.subscriptions}
+        by_name["HEARTBEAT"](
+            _DirectMessage(
+                "HEARTBEAT",
+                {"base_mode": 128, "system_status": square.MAV_STATE_STANDBY},
+            ),
+            None,
+        )
+        self.assertFalse(vehicle.feed_gate())
+        self.assertFalse(vehicle.position_fed)
+        self.assertEqual(inner.emits, 0)
+        self.assertEqual(inner.ingested[0][0], "HEARTBEAT")
+        by_name["LOCAL_POSITION_NED"](
+            _DirectMessage(
+                "LOCAL_POSITION_NED",
+                {"x": 1.25, "y": -2.5, "z": 0.0, "vx": 0.0, "vy": 0.0, "vz": 0.0},
+            ),
+            None,
+        )
+        with redirect_stdout(io.StringIO()) as out:
+            fed = vehicle.feed_gate()
+        self.assertTrue(fed)
+        self.assertTrue(vehicle.position_fed)
+        self.assertEqual(inner.emits, 1)
+        self.assertEqual(inner.ingested[-1][0], "LOCAL_POSITION_NED")
+        self.assertEqual(inner.ingested[-1][1]["x"], 1.25)
+        self.assertIn("LOCAL_POSITION_NED", out.getvalue())
+        self.assertFalse(vehicle.feed_gate())
+        self.assertFalse(vehicle.position_fed)
+        self.assertEqual(inner.emits, 1)
+        vehicle.close()
+        self.assertTrue(direct.destroyed)
+
+
+class _FeedInner:
+    def __init__(self) -> None:
+        self.ingested: list[tuple[str, dict[str, object]]] = []
+        self.emits = 0
+        self._pending = False
+
+    def ingest_mavlink(self, name: object, fields: object) -> bool:
+        if not isinstance(fields, dict):
+            return False
+        self.ingested.append((str(name), dict(fields)))
+        self._pending = True
+        return True
+
+    def emit_ingested_telemetry(self) -> bool:
+        if not self._pending:
+            return False
+        self._pending = False
+        self.emits += 1
+        return True
 
 
 class _Gate:

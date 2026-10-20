@@ -2,8 +2,9 @@
 
 OHH-306. The workflow starts ``sim_vehicle.py -v ArduCopter`` headless at the
 pinned Copter-4.7.2 tag, then this script waits until ArduPilot's own pre-arm
-bit, EKF flags, and a 3D GPS fix say the copter is armable. It arms the aerial
-``SafetyGate``, streams an offboard setpoint, arms the autopilot, climbs to
+bit, EKF flags, and a 3D GPS fix say the copter is armable. It emits the newest ``LOCAL_POSITION_NED`` sample into the aerial
+``SafetyGate`` and arms that gate only after the emit, then streams an
+offboard setpoint, arms the autopilot, climbs to
 2.5 m, flies a 4 m square, and lands. ``--print-recipe`` only prints those steps.
 
 ``Robot.connect`` wraps the loopback transport in that gate. Under GitHub
@@ -190,8 +191,9 @@ _EKF_ERRORS = (
     (EKF_GPS_GLITCHING, "EKF GPS glitch"),
 )
 # (message name, MAVLink id, hertz). The first three are the arm gate.
-# The rest are what Ohho already subscribes to; Copter does not send them
-# at the firmware default rate.
+# LOCAL_POSITION_NED and ATTITUDE are subscribed on this same session and
+# emitted into the SafetyGate. Copter does not send them at the firmware
+# default rate.
 STREAM_REQUESTS = (
     ("SYS_STATUS", 1, 2.0),
     ("GPS_RAW_INT", 24, 2.0),
@@ -204,6 +206,9 @@ _READINESS_MESSAGES = frozenset(name for name, _msg_id, _hz in STREAM_REQUESTS[:
 # Not part of the arm gate. HEARTBEAT is streamed at 1 Hz with SR0_* at 0.
 # EXTENDED_SYS_STATE is not. COMMAND_ACK is how Copter answers command 511.
 _LANDED_LINK_MESSAGES = ("HEARTBEAT", "EXTENDED_SYS_STATE", "COMMAND_ACK")
+# Fed into the gate. Requested above; Copter will not send them unasked.
+_GATE_TELEMETRY_MESSAGES = ("LOCAL_POSITION_NED", "ATTITUDE")
+_FRESH_POSITION_BLOCKER = "no fresh local position for the safety gate"
 # MAV_STATE in HEARTBEAT.system_status. Copter-4.7.2
 # GCS_MAVLINK_Copter::vehicle_system_status returns STANDBY when
 # ap.land_complete is set, and ACTIVE when it is not (after init).
@@ -653,7 +658,9 @@ def recipe() -> str:
             "ready-to-arm, and GPS fix_type is at least 3. The wait is bounded "
             "and prints each check that is still failing. Arming checks stay "
             "at their defaults.",
-            "3. Arm the aerial SafetyGate, stream a ground-hold offboard setpoint "
+            "3. Emit the newest LOCAL_POSITION_NED sample into the aerial "
+            "SafetyGate and arm it only after that sample. Stream a "
+            "ground-hold offboard setpoint "
             f"at {STREAM_HZ:g} Hz, and arm the autopilot "
             "(MAV_CMD_COMPONENT_ARM_DISARM param1 1, param2 0). "
             "The gate refuses that arm unless a setpoint was forwarded in the "
@@ -813,9 +820,10 @@ def fly_square(
     """Arm the gate, stream a setpoint, arm, climb, fly, and land.
 
     On a miss after the vehicle may be airborne, sends land and does not disarm.
-    A pre-arm telemetry miss while the autopilot is still disarmed does not
-    call land: the gate refuses that as ``not_armed``. The exception still
-    propagates so ``main`` writes square-result.json.
+    A pre-arm telemetry miss, or a safety-gate arm refusal, while the autopilot
+    is still disarmed does not call land: the gate refuses that as
+    ``not_armed``. The exception still propagates so ``main`` writes
+    square-result.json.
     """
     period = 1.0 / STREAM_HZ
     try:
@@ -840,10 +848,17 @@ def fly_square(
 
 
 def _land_after_flight_failure(vehicle: object, exc: BaseException) -> None:
-    """Land after a miss, except a disarmed pre-arm telemetry failure."""
+    """Land after a miss, except a disarmed failure the gate would refuse."""
     if _disarmed_prearm_telemetry_failure(vehicle, exc):
         print(
             "not landing: pre-arm telemetry failed while the autopilot is disarmed",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    if _disarmed_gate_arm_refusal(vehicle, exc):
+        print(
+            "not landing: safety gate arm was refused while the autopilot is disarmed",
             file=sys.stderr,
             flush=True,
         )
@@ -852,6 +867,21 @@ def _land_after_flight_failure(vehicle: object, exc: BaseException) -> None:
         _call(vehicle, "land")
     except Exception as land_exc:
         print(f"land after failure failed: {land_exc}", file=sys.stderr)
+
+
+def _disarmed_gate_arm_refusal(vehicle: object, exc: BaseException) -> bool:
+    """True when the gate refused arm and the autopilot is still disarmed.
+
+    Land goes through the gate, which refuses it as ``not_armed`` until arm
+    has succeeded. The failure still propagates so square-result.json records it.
+    """
+    if "SafetyGate.arm() refused" not in str(exc):
+        return False
+    try:
+        sample = _read(vehicle)
+    except Exception:
+        return True
+    return not sample.armed
 
 
 def _disarmed_prearm_telemetry_failure(vehicle: object, exc: BaseException) -> bool:
@@ -1008,6 +1038,17 @@ def _arm_blockers(sample: VehicleSample) -> tuple[str, ...]:
     return tuple(reasons)
 
 
+def _fresh_position_blocker(vehicle: object) -> str | None:
+    """Block arm until this read emitted a new local-position sample.
+
+    Vehicles that do not track ``position_fed`` are unchanged.
+    """
+    fed = getattr(vehicle, "position_fed", None)
+    if fed is None or fed:
+        return None
+    return _FRESH_POSITION_BLOCKER
+
+
 def _wait_until_armable(
     vehicle: object,
     timeout_s: float,
@@ -1034,6 +1075,9 @@ def _wait_until_armable(
         sample = _read(vehicle)
         _raise_if_flags(sample)
         reasons = _arm_blockers(sample)
+        position = _fresh_position_blocker(vehicle)
+        if position is not None:
+            reasons = reasons + (position,)
         if not reasons:
             print("autopilot is armable", flush=True)
             return sample
@@ -1415,6 +1459,8 @@ class CopterReadinessWatch:
         self._interval_accepted = 0
         self._interval_rejected = 0
         self._reject_names: set[str] = set()
+        self._pending: dict[str, dict[str, object]] = {}
+        self._pending_new = False
 
     @property
     def note(self) -> str:
@@ -1461,6 +1507,11 @@ class CopterReadinessWatch:
             detail = "; ".join(errors) or "no message subscription"
             self._note = f"ardupilot readiness not attached: {detail}"
             return
+        for name in _GATE_TELEMETRY_MESSAGES:
+            try:
+                subscribe(name, self._on_message)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
         for name in _LANDED_LINK_MESSAGES:
             try:
                 subscribe(name, self._on_message)
@@ -1469,7 +1520,8 @@ class CopterReadinessWatch:
         self._direct = direct
         self._note = (
             "reading ArduPilot SYS_STATUS, EKF_STATUS_REPORT, and "
-            "GPS_RAW_INT on the open session"
+            "GPS_RAW_INT on the open session; "
+            "LOCAL_POSITION_NED is emitted into the safety gate"
         )
         if errors:
             self._note += f" ({'; '.join(errors)})"
@@ -1526,6 +1578,24 @@ class CopterReadinessWatch:
             )
         return len(sent)
 
+    def take_vehicle_messages(self) -> tuple[tuple[str, Mapping[str, object]], ...]:
+        """Messages received since the last take. Each name is delivered once."""
+        with self._lock:
+            if not self._pending_new:
+                return ()
+            items = tuple(
+                (name, dict(fields)) for name, fields in self._pending.items()
+            )
+            self._pending.clear()
+            self._pending_new = False
+        return items
+
+    def _remember_message(self, name: str, fields: Mapping[str, object]) -> None:
+        stored = {str(key): value for key, value in fields.items()}
+        with self._lock:
+            self._pending[name] = stored
+            self._pending_new = True
+
     def link_landed(self) -> tuple[str | None, str | None]:
         """``(extended, heartbeat)`` from messages this session has received."""
         with self._lock:
@@ -1554,6 +1624,7 @@ class CopterReadinessWatch:
         if fields is None:
             return
         upper = name.strip().upper()
+        self._remember_message(upper, fields)
         if upper == "COMMAND_ACK":
             self._on_command_ack(fields)
             return
@@ -1654,8 +1725,56 @@ class OhhoVehicle:
         self._robot = robot
         self._frame = frame
         self._health = CopterReadinessWatch() if health is None else health
+        self._position_fed = False
+        self._announced_feed = False
         if health is None:
             self._health.attach(robot)
+
+    @property
+    def position_fed(self) -> bool:
+        """True when the last ``read`` emitted a new local-position sample."""
+        return self._position_fed
+
+    def feed_gate(self) -> bool:
+        """Emit newly received vehicle messages into the safety gate.
+
+        Returns True only when that emit included a ``LOCAL_POSITION_NED``
+        sample. A later call with no new position message does not emit again.
+        """
+        take = getattr(self._health, "take_vehicle_messages", None)
+        if not callable(take):
+            self._position_fed = False
+            return False
+        messages = take()
+        if not isinstance(messages, tuple) or not messages:
+            self._position_fed = False
+            return False
+        transport = _mavlink_transport(self._robot)
+        ingest = getattr(transport, "ingest_mavlink", None)
+        emit = getattr(transport, "emit_ingested_telemetry", None)
+        if not callable(ingest) or not callable(emit):
+            self._position_fed = False
+            return False
+        saw_position = False
+        for item in messages:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            name, fields = item
+            if not isinstance(fields, Mapping):
+                continue
+            if not ingest(name, fields):
+                continue
+            if str(name).strip().upper() == "LOCAL_POSITION_NED":
+                saw_position = True
+        if not saw_position:
+            self._position_fed = False
+            return False
+        emitted = bool(emit())
+        self._position_fed = emitted
+        if emitted and not self._announced_feed:
+            self._announced_feed = True
+            print("safety gate fed from LOCAL_POSITION_NED", flush=True)
+        return emitted
 
     @property
     def arm_health_note(self) -> str:
@@ -1669,6 +1788,7 @@ class OhhoVehicle:
         return self._health.interval_ack_note
 
     def read(self) -> VehicleSample:
+        self.feed_gate()
         tele = self._robot.telemetry()
         custom = getattr(tele, "custom", None)
         if not isinstance(custom, Mapping):
@@ -1715,7 +1835,12 @@ class OhhoVehicle:
             raise SquareFailed(f"{label} refused by SafetyGate: {error}")
 
     def arm_gate(self) -> None:
-        """Arm the safety gate. This does not arm the autopilot."""
+        """Arm the safety gate. This does not arm the autopilot.
+
+        A position sample that arrived after the last read is emitted first.
+        Repeating an older sample does not mark the gate fresh.
+        """
+        self.feed_gate()
         gate = self._gate()
         if bool(getattr(gate, "latched", False)):
             reason = getattr(gate, "latch_reason", None)
