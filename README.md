@@ -16,6 +16,12 @@ git clone https://github.com/ohho-robotics/ohho-drone.git
 
 There is no install step. Nothing in this tree builds or launches a robot.
 
+## Emergency stop
+
+This tree is a software simulation sketch. The experimental transport refuses any connection that is not a local loopback address. An explicit simulation flag may also allow a local container hostname, and it still refuses every other address.
+
+Emergency stop does not kill motors in the air. An airborne vehicle is commanded to land. If it is unknown whether the vehicle is on the ground, the transport commands a hold and then a landing. Motors are disarmed only after the vehicle is confirmed on the ground.
+
 ## License
 
 [Apache License 2.0](LICENSE).
@@ -27,3 +33,7 @@ Not in this repository:
 - A checked-in airframe description and a simulator launch that runs from public packages
 - A flight-controller hello-world
 - Hardware bring-up for a specific airframe
+
+## Documentation
+
+For experimental stretch work (software simulation only, not flight-ready), see [docs/README.md](docs/README.md) and [AGENTS.md](AGENTS.md).
