@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Callable
 
@@ -566,6 +566,45 @@ class ArmReadinessTests(unittest.TestCase):
         self.assertIn("link down", blockers)
         self.assertIn("landed_state is in_air", blockers)
 
+    def test_disarmed_prearm_telemetry_failure_does_not_land(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.landed_state = "unknown"
+        clock = FakeClock()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(square.SquareFailed) as caught:
+                square.fly_square(
+                    vehicle,
+                    sleep=clock.sleep,
+                    monotonic=clock,
+                    ground_timeout_s=0.2,
+                )
+        self.assertIn("no on_ground telemetry before arm", str(caught.exception))
+        self.assertNotIn("land", vehicle.calls)
+        self.assertNotIn("arm", vehicle.calls)
+        self.assertIn("not landing", err.getvalue())
+        payload = square._failure_payload(caught.exception, 1.25)
+        self.assertFalse(payload["passed"])
+        self.assertTrue(payload["attempted"])
+        self.assertIn(
+            "no on_ground telemetry before arm", str(payload["message"])
+        )
+
+    def test_armed_vehicle_still_lands_when_the_ground_wait_fails(self) -> None:
+        vehicle = FakeVehicle()
+        vehicle.landed_state = "unknown"
+        vehicle.armed = True
+        clock = FakeClock()
+        with self.assertRaises(square.SquareFailed):
+            square.fly_square(
+                vehicle,
+                sleep=clock.sleep,
+                monotonic=clock,
+                ground_timeout_s=0.2,
+            )
+        self.assertIn("land", vehicle.calls)
+        self.assertNotIn("disarm", vehicle.calls)
+
 
 class _DirectMessage:
     def __init__(self, message_name: str, fields: dict[str, object]) -> None:
@@ -695,7 +734,17 @@ class HealthWatchTests(unittest.TestCase):
         direct = _Direct(object())
         watch = self._attach(robot, direct)
         names = [name for name, _callback in direct.subscriptions]
-        self.assertEqual(names, ["SYS_STATUS", "GPS_RAW_INT", "EKF_STATUS_REPORT"])
+        self.assertEqual(
+            names,
+            [
+                "SYS_STATUS",
+                "GPS_RAW_INT",
+                "EKF_STATUS_REPORT",
+                "HEARTBEAT",
+                "EXTENDED_SYS_STATE",
+                "COMMAND_ACK",
+            ],
+        )
         self.assertIs(direct.system, action._owner)
         self.assertIsNone(direct.user_data)
         self.assertIn("reading ArduPilot SYS_STATUS", watch.note)
@@ -814,6 +863,160 @@ class HealthWatchTests(unittest.TestCase):
         self.assertIn("message interval request failed", buf.getvalue())
         self.assertFalse(watch.poll().ready())
         watch.close()
+
+    def test_unknown_is_not_ground_until_copter_says_landed(self) -> None:
+        self.assertEqual(
+            square.landed_state_from_copter_heartbeat({"system_status": 3}),
+            "on_ground",
+        )
+        self.assertEqual(
+            square.landed_state_from_copter_heartbeat({"system_status": 4}),
+            "in_air",
+        )
+        self.assertEqual(
+            square.landed_state_from_copter_heartbeat({"system_status": 1}),
+            "unknown",
+        )
+        self.assertEqual(
+            square.landed_state_from_copter_heartbeat({"system_status": 5}),
+            "unknown",
+        )
+        self.assertIsNone(square.landed_state_from_copter_heartbeat({}))
+        self.assertEqual(
+            square.landed_state_from_extended_sys_state({"landed_state": 1}),
+            "on_ground",
+        )
+        self.assertEqual(
+            square.landed_state_from_extended_sys_state({"landed_state": 0}),
+            "unknown",
+        )
+        self.assertIsNone(
+            square.landed_state_from_extended_sys_state({"landed_state": 9})
+        )
+        self.assertEqual(
+            square.prefer_landed_state("unknown", None, "on_ground"), "on_ground"
+        )
+        self.assertEqual(
+            square.prefer_landed_state("unknown", None, "unknown"), "unknown"
+        )
+        self.assertEqual(square.prefer_landed_state("unknown", None, None), "unknown")
+        self.assertEqual(
+            square.prefer_landed_state("in_air", None, "on_ground"), "in_air"
+        )
+        self.assertEqual(
+            square.prefer_landed_state("in_air", "on_ground", "in_air"), "on_ground"
+        )
+        self.assertEqual(
+            square.prefer_landed_state("unknown", "unknown", "on_ground"), "on_ground"
+        )
+
+        robot, _action = self._robot()
+        drone = robot.custom["drone"]
+        assert isinstance(drone, dict)
+        drone["landed_state"] = "unknown"
+        direct = _Direct(object())
+        watch = self._attach(robot, direct)
+        by_name = {name: callback for name, callback in direct.subscriptions}
+        vehicle = square.OhhoVehicle(robot, object(), health=watch)
+        self.assertEqual(vehicle.read().landed_state, "unknown")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            by_name["COMMAND_ACK"](
+                _DirectMessage.from_mapping(
+                    "COMMAND_ACK", {"command": 511, "result": 2}
+                ),
+                None,
+            )
+            by_name["HEARTBEAT"](
+                _DirectMessage.from_mapping(
+                    "HEARTBEAT", {"system_status": 1, "base_mode": 0}
+                ),
+                None,
+            )
+        self.assertEqual(vehicle.read().landed_state, "unknown")
+        self.assertIn("DENIED", out.getvalue())
+        self.assertIn("rejected DENIED", watch.interval_ack_note)
+        detail = square._timeout_detail(
+            vehicle, "no on_ground telemetry before arm", vehicle.read()
+        )
+        self.assertIn("last=unknown", detail)
+        self.assertIn("SET_MESSAGE_INTERVAL rejected DENIED", detail)
+
+        with redirect_stdout(io.StringIO()):
+            by_name["HEARTBEAT"](
+                _DirectMessage.from_mapping(
+                    "HEARTBEAT", {"system_status": square.MAV_STATE_STANDBY}
+                ),
+                None,
+            )
+        self.assertEqual(vehicle.read().landed_state, "on_ground")
+
+        by_name["HEARTBEAT"](
+            _DirectMessage.from_mapping(
+                "HEARTBEAT", {"system_status": square.MAV_STATE_ACTIVE}
+            ),
+            None,
+        )
+        self.assertEqual(vehicle.read().landed_state, "in_air")
+
+        with redirect_stdout(io.StringIO()):
+            by_name["EXTENDED_SYS_STATE"](
+                _DirectMessage.from_mapping(
+                    "EXTENDED_SYS_STATE",
+                    {"landed_state": square.MAV_LANDED_STATE_ON_GROUND},
+                ),
+                None,
+            )
+        self.assertEqual(vehicle.read().landed_state, "on_ground")
+
+        by_name["EXTENDED_SYS_STATE"](
+            _DirectMessage.from_mapping(
+                "EXTENDED_SYS_STATE",
+                {"landed_state": square.MAV_LANDED_STATE_UNDEFINED},
+            ),
+            None,
+        )
+        self.assertEqual(vehicle.read().landed_state, "in_air")
+
+        drone["landed_state"] = "takeoff"
+        with redirect_stdout(io.StringIO()):
+            by_name["HEARTBEAT"](
+                _DirectMessage.from_mapping(
+                    "HEARTBEAT", {"system_status": square.MAV_STATE_STANDBY}
+                ),
+                None,
+            )
+        self.assertEqual(vehicle.read().landed_state, "takeoff")
+
+        with redirect_stdout(io.StringIO()):
+            by_name["EXTENDED_SYS_STATE"](
+                _DirectMessage.from_mapping(
+                    "EXTENDED_SYS_STATE",
+                    {"landed_state": square.MAV_LANDED_STATE_LANDING},
+                ),
+                None,
+            )
+        self.assertEqual(vehicle.read().landed_state, "landing")
+
+        with redirect_stdout(io.StringIO()):
+            by_name["COMMAND_ACK"](
+                _DirectMessage.from_mapping(
+                    "COMMAND_ACK",
+                    {"command": square.MAV_CMD_SET_MESSAGE_INTERVAL, "result": 0},
+                ),
+                None,
+            )
+        accepted_note = watch.interval_ack_note
+        self.assertIn("accepted x1", accepted_note)
+        self.assertIn("rejected DENIED x1", accepted_note)
+        by_name["COMMAND_ACK"](
+            _DirectMessage.from_mapping("COMMAND_ACK", {"command": 400, "result": 0}),
+            None,
+        )
+        self.assertEqual(watch.interval_ack_note, accepted_note)
+        vehicle.close()
+        self.assertTrue(direct.destroyed)
 
 
 class _Gate:

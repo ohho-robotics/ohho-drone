@@ -201,6 +201,37 @@ STREAM_REQUESTS = (
     ("EXTENDED_SYS_STATE", 245, 2.0),
 )
 _READINESS_MESSAGES = frozenset(name for name, _msg_id, _hz in STREAM_REQUESTS[:3])
+# Not part of the arm gate. HEARTBEAT is streamed at 1 Hz with SR0_* at 0.
+# EXTENDED_SYS_STATE is not. COMMAND_ACK is how Copter answers command 511.
+_LANDED_LINK_MESSAGES = ("HEARTBEAT", "EXTENDED_SYS_STATE", "COMMAND_ACK")
+# MAV_STATE in HEARTBEAT.system_status. Copter-4.7.2
+# GCS_MAVLINK_Copter::vehicle_system_status returns STANDBY when
+# ap.land_complete is set, and ACTIVE when it is not (after init).
+MAV_STATE_STANDBY = 3
+MAV_STATE_ACTIVE = 4
+# MAV_LANDED_STATE on EXTENDED_SYS_STATE. 0 is undefined, never on_ground.
+MAV_LANDED_STATE_UNDEFINED = 0
+MAV_LANDED_STATE_ON_GROUND = 1
+MAV_LANDED_STATE_IN_AIR = 2
+MAV_LANDED_STATE_TAKEOFF = 3
+MAV_LANDED_STATE_LANDING = 4
+MAV_RESULT_ACCEPTED = 0
+_MAV_RESULT_NAMES = {
+    0: "ACCEPTED",
+    1: "TEMPORARILY_REJECTED",
+    2: "DENIED",
+    3: "UNSUPPORTED",
+    4: "FAILED",
+    5: "IN_PROGRESS",
+    6: "CANCELLED",
+}
+_KNOWN_LANDED = frozenset({"on_ground", "in_air", "takeoff", "landing"})
+_EXTENDED_LANDED = {
+    MAV_LANDED_STATE_ON_GROUND: "on_ground",
+    MAV_LANDED_STATE_IN_AIR: "in_air",
+    MAV_LANDED_STATE_TAKEOFF: "takeoff",
+    MAV_LANDED_STATE_LANDING: "landing",
+}
 
 
 @dataclass(frozen=True)
@@ -273,6 +304,64 @@ def _mav_int(value: object) -> int | None:
         if sign.isdigit():
             return int(text)
     return None
+
+
+def landed_state_from_extended_sys_state(
+    fields: Mapping[str, object],
+) -> str | None:
+    """``EXTENDED_SYS_STATE.landed_state`` as an Ohho name.
+
+    Copter-4.7.2 ``GCS_MAVLINK_Copter::landed_state`` sends
+    ``MAV_LANDED_STATE_ON_GROUND`` when ``ap.land_complete`` is set.
+    ``0`` (undefined) and an unrecognised value are not on the ground.
+    A missing field means the message was not that report.
+    """
+    raw = _mav_int(fields.get("landed_state"))
+    if raw is None:
+        return None
+    if raw == MAV_LANDED_STATE_UNDEFINED:
+        return "unknown"
+    return _EXTENDED_LANDED.get(raw)
+
+
+def landed_state_from_copter_heartbeat(fields: Mapping[str, object]) -> str | None:
+    """Copter-4.7.2 on-ground signal from ``HEARTBEAT.system_status``.
+
+    ``vehicle_system_status`` returns ``MAV_STATE_STANDBY`` when
+    ``ap.land_complete`` is set. That is the same flag
+    ``landed_state()`` maps to ``MAV_LANDED_STATE_ON_GROUND``.
+    ``ArduCopter/land_detector.cpp`` sets ``land_complete`` whenever the
+    motors are disarmed. ``MAV_STATE_ACTIVE`` means that flag is clear,
+    so the vehicle is not on the ground. Boot, critical, and any other
+    status are not evidence of being on the ground. A missing
+    ``system_status`` is not a heartbeat we can use.
+    """
+    status = _mav_int(fields.get("system_status"))
+    if status is None:
+        return None
+    if status == MAV_STATE_STANDBY:
+        return "on_ground"
+    if status == MAV_STATE_ACTIVE:
+        return "in_air"
+    return "unknown"
+
+
+def prefer_landed_state(
+    reported: str, extended: str | None, heartbeat: str | None
+) -> str:
+    """Pick a landed state without treating "unknown" as on the ground.
+
+    A known ``EXTENDED_SYS_STATE`` value is the autopilot's landed field.
+    Otherwise keep a real telemetry report. Fill a missing report from
+    ``HEARTBEAT`` only when that heartbeat says on_ground or in_air.
+    """
+    if extended in _KNOWN_LANDED:
+        return extended
+    if reported in _KNOWN_LANDED:
+        return reported
+    if heartbeat in {"on_ground", "in_air"}:
+        return heartbeat
+    return "unknown"
 
 
 def apply_mavlink_message(
@@ -616,13 +705,26 @@ def _wait(
     deadline = monotonic() + timeout_s
     last: VehicleSample | None = None
     while monotonic() < deadline:
+        _request_vehicle_streams(vehicle, monotonic())
         last = _read(vehicle)
         _raise_if_flags(last)
         if predicate(last):
             return last
         sleep(period_s)
-    detail = on_fail if last is None else f"{on_fail}; last={last.landed_state} z={last.z}"
-    raise SquareFailed(detail)
+    raise SquareFailed(_timeout_detail(vehicle, on_fail, last))
+
+
+def _timeout_detail(
+    vehicle: object, on_fail: str, last: VehicleSample | None
+) -> str:
+    if last is None:
+        detail = on_fail
+    else:
+        detail = f"{on_fail}; last={last.landed_state} z={last.z}"
+    note = getattr(vehicle, "interval_ack_note", None)
+    if isinstance(note, str) and note:
+        detail = f"{detail}; {note}"
+    return detail
 
 
 def _read(vehicle: object) -> VehicleSample:
@@ -711,7 +813,9 @@ def fly_square(
     """Arm the gate, stream a setpoint, arm, climb, fly, and land.
 
     On a miss after the vehicle may be airborne, sends land and does not disarm.
-    A gate refusal stays the exception ``main`` writes into square-result.json.
+    A pre-arm telemetry miss while the autopilot is still disarmed does not
+    call land: the gate refuses that as ``not_armed``. The exception still
+    propagates so ``main`` writes square-result.json.
     """
     period = 1.0 / STREAM_HZ
     try:
@@ -730,12 +834,34 @@ def fly_square(
             corner_timeout_s=corner_timeout_s,
             land_timeout_s=land_timeout_s,
         )
-    except Exception:
-        try:
-            _call(vehicle, "land")
-        except Exception as land_exc:
-            print(f"land after failure failed: {land_exc}", file=sys.stderr)
+    except Exception as exc:
+        _land_after_flight_failure(vehicle, exc)
         raise
+
+
+def _land_after_flight_failure(vehicle: object, exc: BaseException) -> None:
+    """Land after a miss, except a disarmed pre-arm telemetry failure."""
+    if _disarmed_prearm_telemetry_failure(vehicle, exc):
+        print(
+            "not landing: pre-arm telemetry failed while the autopilot is disarmed",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    try:
+        _call(vehicle, "land")
+    except Exception as land_exc:
+        print(f"land after failure failed: {land_exc}", file=sys.stderr)
+
+
+def _disarmed_prearm_telemetry_failure(vehicle: object, exc: BaseException) -> bool:
+    if "no on_ground telemetry before arm" not in str(exc):
+        return False
+    try:
+        sample = _read(vehicle)
+    except Exception:
+        return False
+    return not sample.armed
 
 
 def _call(vehicle: object, name: str, *args: object) -> None:
@@ -1284,6 +1410,11 @@ class CopterReadinessWatch:
         self._target_system = 1
         self._last_request: float | None = None
         self._announced = False
+        self._extended: str | None = None
+        self._heartbeat: str | None = None
+        self._interval_accepted = 0
+        self._interval_rejected = 0
+        self._reject_names: set[str] = set()
 
     @property
     def note(self) -> str:
@@ -1330,6 +1461,11 @@ class CopterReadinessWatch:
             detail = "; ".join(errors) or "no message subscription"
             self._note = f"ardupilot readiness not attached: {detail}"
             return
+        for name in _LANDED_LINK_MESSAGES:
+            try:
+                subscribe(name, self._on_message)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
         self._direct = direct
         self._note = (
             "reading ArduPilot SYS_STATUS, EKF_STATUS_REPORT, and "
@@ -1390,6 +1526,26 @@ class CopterReadinessWatch:
             )
         return len(sent)
 
+    def link_landed(self) -> tuple[str | None, str | None]:
+        """``(extended, heartbeat)`` from messages this session has received."""
+        with self._lock:
+            return self._extended, self._heartbeat
+
+    @property
+    def interval_ack_note(self) -> str:
+        """COMMAND_ACK results for ``MAV_CMD_SET_MESSAGE_INTERVAL``."""
+        with self._lock:
+            accepted = self._interval_accepted
+            rejected = self._interval_rejected
+            names = tuple(self._reject_names)
+        parts: list[str] = []
+        if accepted:
+            parts.append(f"SET_MESSAGE_INTERVAL accepted x{accepted}")
+        if rejected:
+            shown = ", ".join(names) if names else "rejected"
+            parts.append(f"SET_MESSAGE_INTERVAL rejected {shown} x{rejected}")
+        return "; ".join(parts)
+
     def _on_message(self, message: object, _user_data: object = None) -> None:
         name = getattr(message, "message_name", None)
         if not isinstance(name, str):
@@ -1397,8 +1553,72 @@ class CopterReadinessWatch:
         fields = parse_mavlink_fields(getattr(message, "fields_json", None))
         if fields is None:
             return
+        upper = name.strip().upper()
+        if upper == "COMMAND_ACK":
+            self._on_command_ack(fields)
+            return
+        if upper == "EXTENDED_SYS_STATE":
+            self._on_extended(fields)
+            return
+        if upper == "HEARTBEAT":
+            self._on_heartbeat(fields)
+            return
         with self._lock:
             self._latest = apply_mavlink_message(self._latest, name, fields)
+
+    def _on_command_ack(self, fields: Mapping[str, object]) -> None:
+        command = _mav_int(fields.get("command"))
+        result = _mav_int(fields.get("result"))
+        if command != MAV_CMD_SET_MESSAGE_INTERVAL or result is None:
+            return
+        label = _MAV_RESULT_NAMES.get(result, str(result))
+        announce = False
+        accepted = result == MAV_RESULT_ACCEPTED
+        with self._lock:
+            if accepted:
+                self._interval_accepted += 1
+                announce = self._interval_accepted == 1
+            else:
+                self._interval_rejected += 1
+                announce = label not in self._reject_names
+                self._reject_names.add(label)
+        if not announce:
+            return
+        if accepted:
+            print("SET_MESSAGE_INTERVAL accepted", flush=True)
+            return
+        print(
+            f"SET_MESSAGE_INTERVAL rejected: result {label} ({result})",
+            flush=True,
+        )
+
+    def _on_extended(self, fields: Mapping[str, object]) -> None:
+        state = landed_state_from_extended_sys_state(fields)
+        if state is None:
+            return
+        announce = False
+        with self._lock:
+            if state in _KNOWN_LANDED and state != self._extended:
+                announce = True
+            self._extended = state
+        if announce:
+            print(f"EXTENDED_SYS_STATE landed_state {state}", flush=True)
+
+    def _on_heartbeat(self, fields: Mapping[str, object]) -> None:
+        state = landed_state_from_copter_heartbeat(fields)
+        if state is None:
+            return
+        announce = False
+        with self._lock:
+            if state == "on_ground" and self._heartbeat != "on_ground":
+                announce = True
+            self._heartbeat = state
+        if announce:
+            print(
+                "on_ground from HEARTBEAT system_status STANDBY "
+                "(Copter land_complete)",
+                flush=True,
+            )
 
     def poll(self) -> CopterReadiness:
         with self._lock:
@@ -1444,6 +1664,10 @@ class OhhoVehicle:
     def request_streams(self, *, now: float | None = None) -> int:
         return self._health.request_streams(now=now)
 
+    @property
+    def interval_ack_note(self) -> str:
+        return self._health.interval_ack_note
+
     def read(self) -> VehicleSample:
         tele = self._robot.telemetry()
         custom = getattr(tele, "custom", None)
@@ -1463,7 +1687,10 @@ class OhhoVehicle:
             y=float(pose["y"]),
             z=float(pose["z"]),
             armed=bool(drone.get("armed")),
-            landed_state=str(drone.get("landed_state", "unknown")),
+            landed_state=prefer_landed_state(
+                str(drone.get("landed_state", "unknown")),
+                *self._health.link_landed(),
+            ),
             flight_mode=str(drone.get("flight_mode", "unknown")),
             failsafe=tuple(str(flag) for flag in flags),
             link_ok=bool(drone.get("link_ok")),
