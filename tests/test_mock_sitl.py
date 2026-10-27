@@ -15,6 +15,8 @@ from ohho_drone.mavlink.messages import (
     MAV_LANDED_STATE_LANDING,
     MAV_LANDED_STATE_ON_GROUND,
     MAV_LANDED_STATE_TAKEOFF,
+    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+    PX4_CUSTOM_MAIN_MODE_OFFBOARD,
     PX4_MODE_AUTO_LOITER,
 )
 from ohho_drone.schema import ConnectionState, DroneVelocity, FlightMode
@@ -51,7 +53,20 @@ class TestMockSitlIntegration(unittest.TestCase):
 
         received = []
         self.transport.on_telemetry(lambda t: received.append(t))
-        self.assertTrue(self._wait_until(lambda: len(received) > 0))
+
+        def _fields_ready() -> bool:
+            # Heartbeat, position, global position, and battery arrive as
+            # separate datagrams. The first callback can precede the fields
+            # this test reads.
+            tele = self.transport.read_drone_telemetry()
+            return (
+                len(received) > 0
+                and tele.pose is not None
+                and tele.global_pos is not None
+                and tele.battery is not None
+            )
+
+        self.assertTrue(self._wait_until(_fields_ready))
         drone_tele = self.transport.read_drone_telemetry()
         self.assertIsNotNone(drone_tele.pose)
         self.assertIsNotNone(drone_tele.global_pos)
@@ -130,10 +145,22 @@ class TestMockSitlIntegration(unittest.TestCase):
 
         before = len(self.server.received_commands())
         self.transport.emergency_stop()
+        # Touchdown clears armed and flight_mode in one step. A wait that
+        # still required the in-air LAND/HOLD state would time out if it
+        # sampled after that. The command log is what remains.
         self.assertTrue(
             self._wait_until(
-                lambda: self.server.armed
-                and self.server.flight_mode in (FlightMode.LAND, FlightMode.HOLD)
+                lambda: (not self.server.armed)
+                and self.server.flight_mode == FlightMode.DISARMED,
+                timeout=5.0,
+            )
+        )
+        self.assertTrue(
+            self._wait_until(
+                lambda: any(
+                    c[0] in (MAV_CMD_NAV_LAND, MAV_CMD_DO_SET_MODE)
+                    for c in self.server.received_commands()[before:]
+                )
             )
         )
         new = self.server.received_commands()[before:]
@@ -188,6 +215,20 @@ class TestMockSitlIntegration(unittest.TestCase):
                 for c in new
             )
         )
+
+    def test_set_offboard_mode_sends_px4_main_mode(self) -> None:
+        """OFFBOARD is PX4 main mode 6 in DO_SET_MODE param2."""
+        self.transport.connect(timeout_s=3.0)
+        self.assertTrue(self.transport.set_offboard_mode(timeout_s=2.0))
+        mode_cmds = [
+            c
+            for c in self.server.received_commands()
+            if c[0] == MAV_CMD_DO_SET_MODE
+        ]
+        self.assertEqual(len(mode_cmds), 1)
+        self.assertEqual(int(mode_cmds[0][1]), MAV_MODE_FLAG_CUSTOM_MODE_ENABLED)
+        self.assertEqual(int(mode_cmds[0][2]), PX4_CUSTOM_MAIN_MODE_OFFBOARD)
+        self.assertEqual(self.server.flight_mode, FlightMode.OFFBOARD)
 
     def test_non_loopback_host_refused(self) -> None:
         """A non-loopback host is refused and never contacts the mock SITL."""

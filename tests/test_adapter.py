@@ -13,11 +13,18 @@ from ohho_drone.mavlink.messages import (
     MAV_FORCE_DISARM_MAGIC,
     MAV_LANDED_STATE_IN_AIR,
     MAV_LANDED_STATE_ON_GROUND,
+    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+    MAV_MODE_FLAG_SAFETY_ARMED,
+    PX4_CUSTOM_MAIN_MODE_AUTO,
+    PX4_CUSTOM_MAIN_MODE_OFFBOARD,
+    PX4_CUSTOM_SUB_MODE_AUTO_LOITER,
     PX4_MODE_AUTO_LOITER,
     AttitudeMessage,
     CommandLongMessage,
+    HeartbeatMessage,
     LocalPositionNedMessage,
     SysStatusMessage,
+    px4_custom_mode,
 )
 from ohho_drone.schema import (
     ConnectionState,
@@ -287,6 +294,45 @@ class TestAdapter(unittest.TestCase):
             SysStatusMessage(battery_remaining=50, voltage_battery=11000)
         )
         self.assertAlmostEqual(transport._telemetry.battery, 0.5)
+
+    def test_heartbeat_offboard_mode_is_reported_and_replaced(self) -> None:
+        """A non-zero PX4 custom mode replaces OFFBOARD instead of leaving it stale."""
+        transport = MavlinkDroneTransport()
+        armed = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | MAV_MODE_FLAG_SAFETY_ARMED
+        transport._process_incoming(
+            HeartbeatMessage(
+                custom_mode=px4_custom_mode(PX4_CUSTOM_MAIN_MODE_OFFBOARD, 0),
+                base_mode=armed,
+            )
+        )
+        tele = transport.read_drone_telemetry()
+        self.assertTrue(tele.armed)
+        self.assertEqual(tele.flight_mode, FlightMode.OFFBOARD)
+
+        transport._process_incoming(
+            HeartbeatMessage(
+                custom_mode=px4_custom_mode(
+                    PX4_CUSTOM_MAIN_MODE_AUTO, PX4_CUSTOM_SUB_MODE_AUTO_LOITER
+                ),
+                base_mode=armed,
+            )
+        )
+        self.assertEqual(transport.read_drone_telemetry().flight_mode, FlightMode.UNKNOWN)
+
+        transport._process_incoming(HeartbeatMessage(custom_mode=0, base_mode=0))
+        tele = transport.read_drone_telemetry()
+        self.assertFalse(tele.armed)
+        self.assertEqual(tele.flight_mode, FlightMode.DISARMED)
+
+    def test_zero_custom_mode_armed_heartbeat_stays_stabilized(self) -> None:
+        """Mock heartbeats outside OFFBOARD use custom_mode 0."""
+        transport = MavlinkDroneTransport()
+        transport._process_incoming(
+            HeartbeatMessage(custom_mode=0, base_mode=MAV_MODE_FLAG_SAFETY_ARMED)
+        )
+        tele = transport.read_drone_telemetry()
+        self.assertTrue(tele.armed)
+        self.assertEqual(tele.flight_mode, FlightMode.STABILIZED)
 
     def test_clamp_helper(self) -> None:
         self.assertEqual(clamp(1.5, 0.0, 1.0), 1.0)

@@ -31,6 +31,7 @@ from ..mavlink.messages import (
     MAV_RESULT_DENIED,
     MAV_TYPE_QUADROTOR,
     PX4_CUSTOM_MAIN_MODE_AUTO,
+    PX4_CUSTOM_MAIN_MODE_OFFBOARD,
     PX4_CUSTOM_SUB_MODE_AUTO_LAND,
     PX4_CUSTOM_SUB_MODE_AUTO_LOITER,
     AttitudeMessage,
@@ -42,6 +43,7 @@ from ..mavlink.messages import (
     LocalPositionNedMessage,
     SetPositionTargetLocalNedMessage,
     SysStatusMessage,
+    px4_custom_mode,
 )
 from ..schema import FlightMode
 
@@ -261,6 +263,9 @@ class MockPx4SitlServer:
         if main_mode == 0 and 0 < custom_mode < 256:
             main_mode = custom_mode
             sub_mode = custom_sub
+        if main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD:
+            self.flight_mode = FlightMode.OFFBOARD
+            return
         if (
             main_mode == PX4_CUSTOM_MAIN_MODE_AUTO
             and sub_mode == PX4_CUSTOM_SUB_MODE_AUTO_LOITER
@@ -353,8 +358,14 @@ class MockPx4SitlServer:
                     base_mode = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
                     if self.armed:
                         base_mode |= MAV_MODE_FLAG_SAFETY_ARMED
+                    # Other modes stay at custom_mode 0 so existing telemetry
+                    # fallbacks are unchanged. OFFBOARD is reported so a
+                    # caller can confirm the mode switch.
+                    custom_mode = 0
+                    if self.flight_mode == FlightMode.OFFBOARD:
+                        custom_mode = px4_custom_mode(PX4_CUSTOM_MAIN_MODE_OFFBOARD, 0)
                     hb = HeartbeatMessage(
-                        custom_mode=0,
+                        custom_mode=custom_mode,
                         type=MAV_TYPE_QUADROTOR,
                         autopilot=MAV_AUTOPILOT_PX4,
                         base_mode=base_mode,

@@ -107,7 +107,7 @@ Sample output:
 ========================================================================
 
 [1/5] Starting in-process Mock PX4 SITL server on 127.0.0.1...
-      Mock SITL server listening on UDP 127.0.0.1:61763
+      Mock SITL server listening on UDP 127.0.0.1:58083
 [2/5] Connecting to MAVLink endpoint (timeout: 4.0s)...
 [+] Connected! Protocol: mavlink, State: connected
     Label: ohho-drone-mavlink (experimental/not-flight-ready)
@@ -124,9 +124,11 @@ Sample output:
       -> Sending TAKEOFF command (target: 2.5m)...
       -> Sending forward velocity setpoint (linear_x=0.5 m/s)...
       -> Sending LAND command...
+      -> Waiting for touchdown and disarm...
+      [+] On ground and disarmed.
 
 [5/5] Disconnecting...
-[+] Clean shutdown complete. Received 246 telemetry frames.
+[+] Clean shutdown complete. Received 413 telemetry frames.
 ```
 
 ### B. Live PX4 SITL Mode
@@ -136,6 +138,8 @@ When PX4 SITL is running, send to its offboard local port (14580). Pass `--takeo
 ```bash
 python scripts/px4_sitl_hello.py --host 127.0.0.1 --port 14580 --takeoff
 ```
+
+Against live PX4, that sequence streams `SET_POSITION_TARGET_LOCAL_NED` at 10 Hz, requests OFFBOARD, and starts the forward velocity only after a heartbeat reports OFFBOARD. The stream stops before the land command. The script then waits until landed state is on ground and the vehicle is disarmed. The `--mock` path still sends a single velocity setpoint, which is what the in-process mock integrates.
 
 ---
 

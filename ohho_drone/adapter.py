@@ -38,6 +38,7 @@ from .mavlink.messages import (
     MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
     MAV_RESULT_ACCEPTED,
     MAV_TYPE_QUADROTOR,
+    PX4_CUSTOM_MAIN_MODE_OFFBOARD,
     PX4_CUSTOM_SUB_MODE_AUTO_LOITER,
     PX4_MODE_AUTO_LOITER,
     AttitudeMessage,
@@ -153,6 +154,28 @@ def simulation_refusal_reason(host: str, *, sitl: bool = False) -> str | None:
         "only accepts loopback hosts (127.0.0.0/8, ::1, localhost). "
         "Pass sitl=True to also allow docker-local hosts. Other hosts are refused."
     )
+
+
+def _flight_mode_from_heartbeat(
+    *, armed: bool, custom_mode: int, previous: FlightMode
+) -> FlightMode:
+    """Map a PX4 HEARTBEAT onto the telemetry flight mode.
+
+    A zero custom_mode is what the in-process mock sends outside OFFBOARD.
+    That path keeps the previous armed/disarmed fallback. A non-zero mode
+    that is not OFFBOARD replaces a stale OFFBOARD report.
+    """
+    if not armed:
+        return FlightMode.DISARMED
+    main_mode = (custom_mode >> 16) & 0xFF
+    if main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD:
+        return FlightMode.OFFBOARD
+    if custom_mode != 0:
+        return FlightMode.UNKNOWN
+    if previous == FlightMode.DISARMED:
+        return FlightMode.STABILIZED
+    return previous
+
 
 # ── Optional OhhO Transport base import ──────────────────────────────────────
 try:
@@ -538,6 +561,25 @@ class MavlinkDroneTransport(BaseTransport):
         )
         return self._send_command_and_wait_ack(cmd, timeout_s=timeout_s)
 
+    def set_offboard_mode(self, timeout_s: float = 2.0) -> bool:
+        """Request PX4 OFFBOARD mode and wait for command acceptance.
+
+        The caller must already be streaming setpoints. PX4 rejects the mode
+        switch until ``SET_POSITION_TARGET_LOCAL_NED`` is arriving. Acceptance
+        is the command ack; the heartbeat custom mode is the mode report.
+        """
+        if self._e_stop or self._state != ConnectionState.CONNECTED:
+            return False
+
+        cmd = self._target_command(
+            MAV_CMD_DO_SET_MODE,
+            param1=float(MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+            # PX4 reads param2 as the main mode, not the packed custom_mode.
+            param2=float(PX4_CUSTOM_MAIN_MODE_OFFBOARD),
+            param3=0.0,
+        )
+        return self._send_command_and_wait_ack(cmd, timeout_s=timeout_s)
+
     # ── Internal Communication & Threads ─────────────────────────────────────
 
     def _set_state(self, new_state: ConnectionState) -> None:
@@ -691,12 +733,11 @@ class MavlinkDroneTransport(BaseTransport):
             if isinstance(msg, HeartbeatMessage):
                 self._last_heartbeat_recv = now
                 self._telemetry.armed = msg.is_armed
-                if msg.is_armed:
-                    if self._telemetry.flight_mode == FlightMode.DISARMED:
-                        self._telemetry.flight_mode = FlightMode.STABILIZED
-                else:
-                    self._telemetry.flight_mode = FlightMode.DISARMED
-
+                self._telemetry.flight_mode = _flight_mode_from_heartbeat(
+                    armed=msg.is_armed,
+                    custom_mode=msg.custom_mode,
+                    previous=self._telemetry.flight_mode,
+                )
                 self._heartbeat_event.set()
 
             elif isinstance(msg, ExtendedSysStateMessage):

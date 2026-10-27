@@ -10,7 +10,8 @@ Usage:
   # Run in mock SITL mode (zero-dependency, suitable for CI and headless testing):
   python scripts/px4_sitl_hello.py --mock
 
-  # Send to a live local PX4 SITL offboard port (PX4 listens on UDP 14580):
+  # Live local PX4 SITL (listens on UDP 14580). --takeoff streams velocity
+  # setpoints, enters OFFBOARD, then stops the stream and lands:
   python scripts/px4_sitl_hello.py --host 127.0.0.1 --port 14580 --takeoff
 """
 
@@ -18,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 # Add repo root to sys.path so script can be run directly
@@ -27,8 +30,109 @@ if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
 from ohho_drone.adapter import MavlinkDroneTransport  # noqa: E402
-from ohho_drone.schema import ConnectionState, DroneVelocity  # noqa: E402
+from ohho_drone.mavlink.messages import MAV_LANDED_STATE_ON_GROUND  # noqa: E402
+from ohho_drone.schema import ConnectionState, DroneVelocity, FlightMode  # noqa: E402
 from ohho_drone.sitl.mock_server import MockPx4SitlServer  # noqa: E402
+
+# PX4 drops OFFBOARD unless setpoints arrive faster than 2 Hz, and it
+# rejects the mode switch until that stream is already running. 10 Hz is
+# the 100 ms timer from the PX4 ROS 2 offboard example.
+_OFFBOARD_STREAM_HZ = 10.0
+_OFFBOARD_LEAD_S = 1.0
+_FORWARD_S = 1.0
+_MODE_TIMEOUT_S = 3.0
+_TOUCHDOWN_TIMEOUT_S = 8.0
+
+
+def _wait_until(predicate: Callable[[], bool], timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def _on_ground_and_disarmed(transport: MavlinkDroneTransport) -> bool:
+    """True only when landed_state and the armed flag both say the flight is over."""
+    tele = transport.read_drone_telemetry()
+    return transport.landed_state == MAV_LANDED_STATE_ON_GROUND and not tele.armed
+
+
+class _VelocitySetpointStream:
+    """Repeat SET_POSITION_TARGET_LOCAL_NED until stop().
+
+    Stop the stream before landing. A setpoint left running keeps PX4 in
+    OFFBOARD and fights the land mode.
+    """
+
+    def __init__(
+        self,
+        transport: MavlinkDroneTransport,
+        velocity: DroneVelocity,
+        rate_hz: float = _OFFBOARD_STREAM_HZ,
+    ) -> None:
+        self._transport = transport
+        self._velocity = velocity
+        self._interval = 1.0 / rate_hz
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, name="Px4SetpointStream", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def update(self, velocity: DroneVelocity) -> None:
+        with self._lock:
+            self._velocity = velocity
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1.0)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                velocity = self._velocity
+            self._transport.send_drone_velocity(velocity)
+            self._stop.wait(self._interval)
+
+
+def _fly_forward_offboard(transport: MavlinkDroneTransport) -> bool:
+    """Stream setpoints, confirm OFFBOARD, move forward, then stop the stream."""
+    hold = DroneVelocity()
+    forward = DroneVelocity(linear_x=0.5, linear_y=0.0, linear_z=0.0)
+    stream = _VelocitySetpointStream(transport, hold)
+    stream.start()
+    try:
+        time.sleep(_OFFBOARD_LEAD_S)
+        print("      -> Requesting OFFBOARD mode...")
+        if not transport.set_offboard_mode():
+            print(
+                "      [-] OFFBOARD mode was not acknowledged. Aborting.",
+                file=sys.stderr,
+            )
+            return False
+        print("      -> Waiting for OFFBOARD mode...")
+        if not _wait_until(
+            lambda: transport.read_drone_telemetry().flight_mode == FlightMode.OFFBOARD,
+            _MODE_TIMEOUT_S,
+        ):
+            print(
+                "      [-] Autopilot did not report OFFBOARD mode. Aborting.",
+                file=sys.stderr,
+            )
+            return False
+        print("      [+] OFFBOARD mode confirmed.")
+        print("      -> Streaming forward velocity setpoint (linear_x=0.5 m/s)...")
+        stream.update(forward)
+        time.sleep(_FORWARD_S)
+        return True
+    finally:
+        stream.stop()
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,13 +282,17 @@ def main() -> int:
                 return 1
             time.sleep(1.0)
 
-            print(
-                "      -> Sending forward velocity setpoint (linear_x=0.5 m/s)..."
-            )
-            transport.send_drone_velocity(
-                DroneVelocity(linear_x=0.5, linear_y=0.0, linear_z=0.0)
-            )
-            time.sleep(1.0)
+            if args.mock:
+                # The mock integrates one setpoint. It does not need a stream.
+                print(
+                    "      -> Sending forward velocity setpoint (linear_x=0.5 m/s)..."
+                )
+                transport.send_drone_velocity(
+                    DroneVelocity(linear_x=0.5, linear_y=0.0, linear_z=0.0)
+                )
+                time.sleep(_FORWARD_S)
+            elif not _fly_forward_offboard(transport):
+                return 1
 
             print("      -> Sending LAND command...")
             if not transport.land():
@@ -193,7 +301,17 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 1
-            time.sleep(0.5)
+            print("      -> Waiting for touchdown and disarm...")
+            if not _wait_until(
+                lambda: _on_ground_and_disarmed(transport),
+                _TOUCHDOWN_TIMEOUT_S,
+            ):
+                print(
+                    "      [-] Touchdown and disarm were not both confirmed. Aborting.",
+                    file=sys.stderr,
+                )
+                return 1
+            print("      [+] On ground and disarmed.")
             sequence_finished = True
 
         print("\n[5/5] Disconnecting...")
