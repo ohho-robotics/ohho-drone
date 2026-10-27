@@ -4,3 +4,7 @@ artifacts/
 *.ulg
 actionlint
 actionlint.exe
+square-result.json
+sim_vehicle.log
+ArduCopter.log
+ardupilot-console-tail.txt
