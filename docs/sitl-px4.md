@@ -15,6 +15,7 @@ records the runtime on its first GitHub Actions run.
 | Dev image | `px4io/px4-dev:v1.17.0` |
 | Image index | `sha256:288dc1d7f5290855e86dbaf8b8f55cd17f46f27e9df2affb2056df6363bc6fb0` |
 | linux/amd64 | `sha256:82e3ddcf4bf3fa4dbc0be6489c6de4158d0efbc8530182c691184302027335ce` |
+| Image ID | `sha256:4592d1b50a5a094e780e573eeaaa932f35dc981db47bce1b65dbccae2a32fb42` |
 | PX4 source | git tag `v1.17.0` |
 | Gazebo | Harmonic (`gz-harmonic`), model `gz_x500`, world `default` |
 | Speed | `PX4_SIM_SPEED_FACTOR=1` |
@@ -51,6 +52,11 @@ configure when `worlds/default.sdf` is missing.
 The plan's budget for a prebuilt image is 20 minutes cold and 8 minutes warm.
 The workflow's hard timeout is 40 minutes so the first compile can finish and
 be compared with that budget. The image cache key is the index digest above.
+The cache stores a `docker save` tarball. Loading it restores the image id
+and leaves `RepoDigests` empty, because that field is registry metadata.
+Every run hashes the index and amd64 manifests and starts the container
+from the image id in the table, the config digest of the amd64 manifest.
+The job pulls the amd64 digest only when that id is not already local.
 
 ## Simulated GCS
 
@@ -174,8 +180,9 @@ or the CI opt-in variables. Outside GitHub Actions, `arm_flight` and
 `takeoff` are refused without a TTY. The local command is the same script
 the CI job runs, without that opt-in. It is not a completed flight.
 
-Confirm the image digest is the index or amd64 digest in the table before
-trusting a retag of `v1.17.0`. `scripts/run_sitl_px4.sh` checks out PX4
+Confirm the image digest is the index or amd64 digest in the table, and
+the image id is the one in the table, before trusting a retag of
+`v1.17.0`. `scripts/run_sitl_px4.sh` checks out PX4
 `v1.17.0`, installs the simulation packages above, checks out the Gazebo
 models submodule, builds `px4_sitl_default`, starts `MicroXRCEAgent udp4 -p
 8888`, then runs `bin/px4 -d` with `HEADLESS=1`, `PX4_SIM_MODEL=gz_x500`,

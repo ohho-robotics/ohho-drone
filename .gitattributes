@@ -1,2 +1,4 @@
 scripts/run_sitl_px4.sh text eol=lf
 .github/workflows/*.yml text eol=lf
+tests/fixtures/px4-dev-v1.17.0-index.json text eol=lf
+tests/fixtures/px4-dev-v1.17.0-amd64.json text eol=lf

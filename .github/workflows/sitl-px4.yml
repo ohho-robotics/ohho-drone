@@ -5,6 +5,12 @@
 # ros2 tag is a v1.18 beta, which ohho-os refuses. This job pins
 # px4io/px4-dev:v1.17.0 by digest and builds gz_x500 from the v1.17.0 git tag.
 #
+# The actions cache stores a docker save tarball. docker load restores the
+# image id and the tag, and leaves RepoDigests empty. scripts/px4_image_pin.py
+# hashes the pinned index and amd64 manifests. The square container runs
+# PX4_IMAGE_ID, the config digest of the amd64 manifest. A tarball that does
+# not have that id is pulled by the amd64 digest.
+#
 # The plan's cold-start budget is 20 minutes for a prebuilt image. The hard
 # timeout is 40 minutes so a cold Gazebo install and PX4 compile can finish
 # and record a runtime against that budget. CI does not set OHHO_ARM_HARDWARE.
@@ -25,8 +31,12 @@ on:
       - "scripts/sitl_square.py"
       - "scripts/run_sitl_px4.sh"
       - "scripts/sitl_gcs_heartbeat.py"
+      - "scripts/px4_image_pin.py"
       - "requirements-sitl.txt"
       - "tests/test_sitl_square.py"
+      - "tests/test_px4_image_pin.py"
+      - "tests/fixtures/px4-dev-v1.17.0-index.json"
+      - "tests/fixtures/px4-dev-v1.17.0-amd64.json"
       - "docs/sitl-px4.md"
 
 permissions:
@@ -37,6 +47,8 @@ env:
   PX4_IMAGE_TAG: v1.17.0
   PX4_IMAGE_INDEX_DIGEST: sha256:288dc1d7f5290855e86dbaf8b8f55cd17f46f27e9df2affb2056df6363bc6fb0
   PX4_IMAGE_AMD64_DIGEST: sha256:82e3ddcf4bf3fa4dbc0be6489c6de4158d0efbc8530182c691184302027335ce
+  # Config digest of the amd64 manifest. This is the Docker image id.
+  PX4_IMAGE_ID: sha256:4592d1b50a5a094e780e573eeaaa932f35dc981db47bce1b65dbccae2a32fb42
 
 jobs:
   criteria:
@@ -81,22 +93,48 @@ jobs:
       - name: Load or pull the pinned image
         run: |
           set -euo pipefail
-          image="${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}"
+          python3 scripts/px4_image_pin.py
+          # Empty RepoDigests are acceptable only for a loaded tarball whose
+          # image id the script just bound to both pinned manifests. A pull
+          # has to record one of those digests.
+          require_repo_digest=1
           if [ -f /tmp/px4-dev-image.tar ]; then
-            docker load -i /tmp/px4-dev-image.tar
-          else
-            docker pull "$image"
-            docker save "$image" -o /tmp/px4-dev-image.tar
+            if docker load -i /tmp/px4-dev-image.tar \
+              && docker image inspect "$PX4_IMAGE_ID" >/dev/null 2>&1
+            then
+              require_repo_digest=0
+            else
+              echo "cached tarball is not the pinned image; pulling by digest" >&2
+            fi
           fi
-          digests="$(docker image inspect "$image" --format '{{json .RepoDigests}}')"
+          if [ "$require_repo_digest" -eq 1 ]; then
+            docker pull "${PX4_IMAGE_REPO}@${PX4_IMAGE_AMD64_DIGEST}"
+          fi
+          actual="$(docker image inspect "$PX4_IMAGE_ID" --format '{{.Id}}')"
+          if [ "$actual" != "$PX4_IMAGE_ID" ]; then
+            echo "refusing image: id ${actual} is not the pinned v1.17.0 image" >&2
+            exit 1
+          fi
+          digests="$(docker image inspect "$PX4_IMAGE_ID" --format '{{json .RepoDigests}}')"
           echo "$digests"
           case "$digests" in
             *"${PX4_IMAGE_INDEX_DIGEST}"*|*"${PX4_IMAGE_AMD64_DIGEST}"*) ;;
+            "[]"|"null")
+              if [ "$require_repo_digest" -eq 1 ]; then
+                echo "refusing image: digest is not the pinned v1.17.0 image" >&2
+                exit 1
+              fi
+              echo "image id ${PX4_IMAGE_ID} matches the pinned manifest"
+              ;;
             *)
               echo "refusing image: digest is not the pinned v1.17.0 image" >&2
               exit 1
               ;;
           esac
+          docker tag "$PX4_IMAGE_ID" "${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}"
+          if [ ! -f /tmp/px4-dev-image.tar ]; then
+            docker save "${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}" -o /tmp/px4-dev-image.tar
+          fi
 
       - name: Fly the square
         env:
@@ -106,7 +144,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           docker rm -f ohho-px4 >/dev/null 2>&1 || true
-          docker run -d --name ohho-px4 \
+          docker run -d --name ohho-px4 --pull never \
             --entrypoint /bin/bash \
             -e HEADLESS=1 \
             -e PX4_SIM_MODEL=gz_x500 \
@@ -119,7 +157,7 @@ jobs:
             -e OHHO_CI_SITL="${OHHO_CI_SITL}" \
             -v "$GITHUB_WORKSPACE:/opt/ohho-drone:ro" \
             -v "$GITHUB_WORKSPACE/artifacts:/artifacts" \
-            "${PX4_IMAGE_REPO}:${PX4_IMAGE_TAG}" \
+            "${PX4_IMAGE_ID}" \
             -lc 'sleep infinity'
           docker exec ohho-px4 bash /opt/ohho-drone/scripts/run_sitl_px4.sh
 
