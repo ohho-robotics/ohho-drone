@@ -22,6 +22,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(WORKFLOW.is_file())
         self.assertIn("name: ArduPilot SITL square", self.text)
 
+    def test_unit_checks_install_the_pinned_pymavlink_before_discover(self) -> None:
+        start = self.text.index("name: Unit tests")
+        stop = self.text.index("name: actionlint", start)
+        step = self.text[start:stop]
+        install = "python -m pip install -r requirements-sitl.txt"
+        discover = "python -m unittest discover -s tests -v"
+        self.assertIn(install, step)
+        self.assertLess(step.index(install), step.index(discover))
+
     def test_triggers_and_artifacts(self) -> None:
         self.assertIn("workflow_dispatch:", self.text)
         self.assertIn("pull_request:", self.text)
