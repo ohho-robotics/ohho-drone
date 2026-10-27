@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-GB
+tone_instructions: "Be concise, direct and constructive. Flag real bugs, security gaps and edge cases first; skip nitpicks that tooling already catches."
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  auto_review:
+    enabled: true
+    drafts: true
+  path_instructions:
+    - path: "scripts/**/*.py"
+      instructions: |
+        Drone SITL/flight scripts. Check arming/mode checks, timeouts, geofence and failsafe handling,
+        and that nothing can command a real vehicle without explicit opt-in.
+    - path: "tests/**"
+      instructions: |
+        Check tests are deterministic and do not require hardware.
+    - path: ".github/workflows/**"
+      instructions: |
+        Check actions are pinned (ideally to a commit SHA), permissions follow least privilege,
+        secrets are never echoed or exposed to untrusted PR code, and caching/matrix logic is correct.
+    - path: "**/*.md"
+      instructions: |
+        Check docs stay accurate against the code (commands, paths, flags). Flag unverifiable claims.

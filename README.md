@@ -6,6 +6,8 @@
 
 This repository is a placeholder for a drone form factor in the [OhhO Robotics](https://github.com/ohho-robotics) org. It does not contain a robot description, flight controller, simulator, or model.
 
+Research and plan; no flight code yet: [docs/research/drone-stacks.md](docs/research/drone-stacks.md), [docs/plan/implementation-plan.md](docs/plan/implementation-plan.md).
+
 ## Clone
 
 ```bash

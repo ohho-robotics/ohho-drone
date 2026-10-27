@@ -44,3 +44,10 @@ venv.bak/
 *~
 .DS_Store
 Thumbs.db
+
+# ArduPilot SITL logs from main
+square-result.json
+sim_vehicle.log
+ArduCopter.log
+ardupilot-console-tail.txt
+*.pyc

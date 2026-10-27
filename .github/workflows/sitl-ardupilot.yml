@@ -1,0 +1,225 @@
+name: ArduPilot SITL square
+
+# OHH-306 / D-22. Headless Copter-4.7.2 via sim_vehicle.py, then the D-07
+# square through Ohho mavlink+udp://127.0.0.1:14540.
+#
+# The 90 minute cap is a budget for a cold source build plus the flight at
+# speedup 1. It is not a measured runtime. The square-result artifact records
+# elapsed_s on the first run.
+#
+# Install pin: ohho-os[mavlink] from branch ohh-305-mavlink-backend
+# (ohho-os draft PR #62). That branch's pyproject name is ohho-os and its
+# optional extra is mavlink. pip discards a requirement named ohho.
+# Human TODO: after that branch merges, install ohho-os[mavlink] from main.
+# pip 25.1 rejects a #egg= fragment that is not a plain project name, so
+# the step uses the name @ url form.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/sitl-ardupilot.yml"
+      - "scripts/ardupilot_sitl_square.py"
+      - "tests/**"
+      - "docs/ardupilot-vs-px4.md"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: unit checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          version=1.7.7
+          curl -sSL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint .github/workflows/sitl-ardupilot.yml
+
+  square:
+    name: Copter SITL square
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      GIT_TERMINAL_PROMPT: "0"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Leave hardware arming unset
+        run: |
+          set -euo pipefail
+          if [ -n "${OHHO_ARM_HARDWARE+x}" ]; then
+            echo "OHHO_ARM_HARDWARE is present in the environment" >&2
+            exit 1
+          fi
+
+      - name: Install OhhO OS from the MAVLink branch
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "ohho-os[mavlink] @ git+https://github.com/ohho-robotics/ohho-os@ohh-305-mavlink-backend"
+          python -m pip show ohho-os
+          python - <<'PY'
+          import importlib.metadata
+          import pathlib
+
+          dist = importlib.metadata.distribution("ohho-os")
+          direct = pathlib.Path(str(dist.locate_file("direct_url.json")))
+          print("ohho-os direct_url:")
+          if direct.is_file():
+              print(direct.read_text(encoding="utf-8"))
+          else:
+              print("direct_url.json missing")
+          PY
+
+      - name: Clone ArduPilot Copter-4.7.2
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch Copter-4.7.2 https://github.com/ArduPilot/ardupilot.git ardupilot
+          test "$(git -C ardupilot rev-parse HEAD)" = "fb773567896014da007bca58358704d4a0d8516f"
+          # Depth-1 submodule fetches use the commit recorded by the tag.
+          # If a submodule server rejects that, fetch the recorded commits in full.
+          if ! git -C ardupilot submodule update --init --recursive --depth 1 --jobs 8; then
+            echo "shallow submodule update failed; fetching recorded submodule commits" >&2
+            git -C ardupilot submodule update --init --recursive --jobs 8
+          fi
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ardupilot/build/sitl
+            /home/runner/.cache/ccache
+          key: sitl-ardupilot-Copter-4.7.2-${{ runner.os }}-v1
+
+      - name: Install SITL prerequisites
+        working-directory: ardupilot
+        run: |
+          set -euo pipefail
+          Tools/environment_install/install-prereqs-ubuntu.sh -y
+
+      - name: Install ArduPilot venv Python packages
+        run: |
+          set -euo pipefail
+          if [ -f "${HOME}/.profile" ]; then
+            # shellcheck disable=SC1090,SC1091
+            source "${HOME}/.profile"
+          fi
+          venv_python="${HOME}/venv-ardupilot/bin/python3"
+          if [ ! -x "${venv_python}" ]; then
+            echo "ArduPilot venv python is missing: ${venv_python}" >&2
+            exit 1
+          fi
+          # Package names and the empy pin live in ARDUPILOT_VENV_PIP_PACKAGES.
+          # Install with the venv interpreter. A bare python3 here is the
+          # setup-python toolcache, which cannot see apt's python3-pexpect.
+          mapfile -t packages < <(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import ardupilot_sitl_square as square; print("\n".join(square.ARDUPILOT_VENV_PIP_PACKAGES))' "${GITHUB_WORKSPACE}/scripts")
+          for package in "${packages[@]}"; do
+            "${venv_python}" -m pip install --upgrade --progress-bar off "${package}"
+          done
+          "${venv_python}" -c "import em; import pexpect; from pymavlink import mavextra; import lxml, serial, psutil, numpy, pyparsing, intelhex, dronecan"
+
+      - name: Build ArduCopter SITL
+        working-directory: ardupilot
+        run: |
+          set -euo pipefail
+          if [ -f "${HOME}/.profile" ]; then
+            # shellcheck disable=SC1090
+            source "${HOME}/.profile"
+          fi
+          ./waf configure --board sitl
+          ./waf copter -j"$(nproc)"
+
+      - name: Start headless sim_vehicle.py
+        working-directory: ardupilot
+        run: |
+          set -euo pipefail
+          if [ -f "${HOME}/.profile" ]; then
+            # shellcheck disable=SC1090
+            source "${HOME}/.profile"
+          fi
+          python3 Tools/autotest/sim_vehicle.py \
+            -v ArduCopter \
+            -w \
+            --speedup=1 \
+            --no-mavproxy \
+            --no-rebuild \
+            -A "--serial0=udpclient:127.0.0.1:14540" \
+            > "${GITHUB_WORKSPACE}/sim_vehicle.log" 2>&1 &
+          echo "$!" > "${GITHUB_WORKSPACE}/sim_vehicle.pid"
+          ready=0
+          for _ in $(seq 1 60); do
+            if [ -s /tmp/ArduCopter.log ]; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${ready}" -ne 1 ]; then
+            echo "SITL log /tmp/ArduCopter.log did not appear" >&2
+            tail -n 200 "${GITHUB_WORKSPACE}/sim_vehicle.log" || true
+            exit 1
+          fi
+
+      - name: Fly the square through mavlink+udp://127.0.0.1:14540
+        env:
+          OHHO_CI_SIM_ARMING: "1"
+          OHHO_CI_SITL: "1"
+        run: |
+          set -euo pipefail
+          python scripts/ardupilot_sitl_square.py --fly --result "${GITHUB_WORKSPACE}/square-result.json"
+
+      - name: Stop SITL
+        if: always()
+        run: |
+          set +e
+          if [ -s sim_vehicle.pid ]; then
+            kill "$(cat sim_vehicle.pid)"
+          fi
+          # Brackets keep pkill from matching this shell's own command line.
+          pkill -f "[b]uild/sitl/bin/arducopter"
+          pkill -f "[s]im_vehicle.py -v ArduCopter"
+          exit 0
+
+      - name: Collect console tails
+        if: always()
+        run: |
+          set +e
+          if [ -f /tmp/ArduCopter.log ]; then
+            cp /tmp/ArduCopter.log "${GITHUB_WORKSPACE}/ArduCopter.log"
+          fi
+          {
+            echo "===== sim_vehicle.log (last 200) ====="
+            tail -n 200 "${GITHUB_WORKSPACE}/sim_vehicle.log"
+            echo "===== ArduCopter.log (last 200) ====="
+            tail -n 200 "${GITHUB_WORKSPACE}/ArduCopter.log"
+          } > "${GITHUB_WORKSPACE}/ardupilot-console-tail.txt"
+          exit 0
+
+      - name: Upload SITL logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardupilot-sitl
+          if-no-files-found: warn
+          path: |
+            square-result.json
+            sim_vehicle.log
+            ArduCopter.log
+            ardupilot-console-tail.txt
