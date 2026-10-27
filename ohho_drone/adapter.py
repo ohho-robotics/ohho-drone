@@ -123,11 +123,8 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _is_docker_local_host(host: str) -> bool:
-    """True for well-known local container DNS names, not routable LAN addresses."""
-    text = _normalize_host(host)
-    if text in _DOCKER_LOCAL_NAMES:
-        return True
-    return text.endswith(".docker.internal") or text.endswith(".containers.internal")
+    """True only for the exact docker-local names in ``_DOCKER_LOCAL_NAMES``."""
+    return _normalize_host(host) in _DOCKER_LOCAL_NAMES
 
 
 def simulation_target_allowed(host: str, *, sitl: bool = False) -> bool:
@@ -260,7 +257,7 @@ class MavlinkDroneTransport(BaseTransport):
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 14540,
+        port: int = 14580,
         sysid: int = 255,  # GCS / companion computer ID
         compid: int = 191,  # MAV_COMP_ID_ONBOARD_COMPUTER
         target_sysid: int = 1,
@@ -298,6 +295,8 @@ class MavlinkDroneTransport(BaseTransport):
         self._heartbeat_event = threading.Event()
         # None until EXTENDED_SYS_STATE arrives. Never inferred as ON_GROUND.
         self._landed_state: int | None = None
+        # Latest ATTITUDE.yawspeed (rad/s). Position updates must not reuse yaw.
+        self._yaw_rate = 0.0
 
         # Command acknowledgment tracking
         self._pending_acks: dict[int, tuple[threading.Event, int]] = {}
@@ -331,6 +330,10 @@ class MavlinkDroneTransport(BaseTransport):
             self._set_state(ConnectionState.CONNECTING)
 
             try:
+                # PX4 SITL v1.14 binds the offboard link on UDP 14580 and sends
+                # heartbeats to UDP 14540. This socket sends to (host, port)
+                # and reads replies on an ephemeral local port. It does not
+                # bind 14540, so a send to that remote port would not be seen.
                 self._sock = socket.socket(self._socket_family(), socket.SOCK_DGRAM)
                 self._sock.setblocking(False)
             except Exception as e:
@@ -709,7 +712,7 @@ class MavlinkDroneTransport(BaseTransport):
             elif isinstance(msg, LocalPositionNedMessage):
                 # Convert NED to OhhO 2D Odometry (x=North, y=East, theta=yaw, vx, vy)
                 theta = self._telemetry.pose.yaw if self._telemetry.pose else 0.0
-                omega = self._telemetry.pose.yaw if self._telemetry.pose else 0.0
+                omega = self._yaw_rate
                 self._telemetry.odom = Odometry(
                     x=msg.x,
                     y=msg.y,
@@ -735,6 +738,7 @@ class MavlinkDroneTransport(BaseTransport):
                 )
 
             elif isinstance(msg, AttitudeMessage):
+                self._yaw_rate = msg.yawspeed
                 current_pose = self._telemetry.pose or DronePose()
                 self._telemetry.pose = DronePose(
                     x=current_pose.x,
@@ -747,6 +751,7 @@ class MavlinkDroneTransport(BaseTransport):
                 if self._telemetry.odom:
                     self._telemetry.odom.theta = msg.yaw
                     self._telemetry.odom.omega = msg.yawspeed
+                self._telemetry.velocity.yaw_rate = msg.yawspeed
 
             elif isinstance(msg, GlobalPositionIntMessage):
                 self._telemetry.global_pos = GlobalCoordinates(
@@ -757,9 +762,13 @@ class MavlinkDroneTransport(BaseTransport):
                 )
 
             elif isinstance(msg, SysStatusMessage):
-                self._telemetry.battery = clamp(
-                    msg.battery_remaining / 100.0, 0.0, 1.0
-                )
+                # MAVLink uses -1 for "remaining unknown". Do not clamp that to 0%.
+                if msg.battery_remaining < 0:
+                    self._telemetry.battery = None
+                else:
+                    self._telemetry.battery = clamp(
+                        msg.battery_remaining / 100.0, 0.0, 1.0
+                    )
                 self._telemetry.voltage_v = msg.voltage_v
                 self._telemetry.current_a = msg.current_a
 

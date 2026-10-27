@@ -49,12 +49,9 @@ class TestMockSitlIntegration(unittest.TestCase):
         """Transport receives local position, attitude, battery, and gnss."""
         self.transport.connect(timeout_s=3.0)
 
-        # Wait for a few telemetry packets
         received = []
         self.transport.on_telemetry(lambda t: received.append(t))
-        time.sleep(0.3)
-
-        self.assertGreater(len(received), 0)
+        self.assertTrue(self._wait_until(lambda: len(received) > 0))
         drone_tele = self.transport.read_drone_telemetry()
         self.assertIsNotNone(drone_tele.pose)
         self.assertIsNotNone(drone_tele.global_pos)
@@ -69,30 +66,24 @@ class TestMockSitlIntegration(unittest.TestCase):
 
         armed = self.transport.arm(timeout_s=2.0)
         self.assertTrue(armed)
-        time.sleep(0.1)
-        self.assertTrue(self.server.armed)
+        self.assertTrue(self._wait_until(lambda: self.server.armed))
 
         disarmed = self.transport.disarm(timeout_s=2.0)
         self.assertTrue(disarmed)
-        time.sleep(0.1)
-        self.assertFalse(self.server.armed)
+        self.assertTrue(self._wait_until(lambda: not self.server.armed))
 
     def test_takeoff_and_velocity_flight(self) -> None:
         """Takeoff causes vehicle altitude climb; velocity causes displacement."""
         self.transport.connect(timeout_s=3.0)
         self.transport.arm(timeout_s=2.0)
 
-        # Takeoff to 2.0m
         self.transport.takeoff(altitude_m=2.0)
-        time.sleep(0.25)
-        self.assertGreater(self.server.altitude, 0.05)
+        self.assertTrue(self._wait_until(lambda: self.server.altitude > 0.05))
 
-        # Velocity setpoint
         self.transport.send_drone_velocity(
             DroneVelocity(linear_x=2.0, linear_y=0.0, linear_z=0.0)
         )
-        time.sleep(0.25)
-        self.assertGreater(self.server.x, 0.05)
+        self.assertTrue(self._wait_until(lambda: self.server.x > 0.05))
 
     def test_emergency_stop_on_ground_disarms(self) -> None:
         """On-ground e-stop disarms only after landed_state confirms ON_GROUND."""
@@ -103,8 +94,7 @@ class TestMockSitlIntegration(unittest.TestCase):
             )
         )
         self.assertTrue(self.transport.arm(timeout_s=2.0))
-        time.sleep(0.1)
-        self.assertTrue(self.server.armed)
+        self.assertTrue(self._wait_until(lambda: self.server.armed))
         self.assertLess(self.server.altitude, 0.15)
 
         before = len(self.server.received_commands())
@@ -140,9 +130,12 @@ class TestMockSitlIntegration(unittest.TestCase):
 
         before = len(self.server.received_commands())
         self.transport.emergency_stop()
-        time.sleep(0.2)
-        self.assertTrue(self.server.armed)
-        self.assertIn(self.server.flight_mode, (FlightMode.LAND, FlightMode.HOLD))
+        self.assertTrue(
+            self._wait_until(
+                lambda: self.server.armed
+                and self.server.flight_mode in (FlightMode.LAND, FlightMode.HOLD)
+            )
+        )
         new = self.server.received_commands()[before:]
         self.assertTrue(
             any(c[0] in (MAV_CMD_NAV_LAND, MAV_CMD_DO_SET_MODE) for c in new)
@@ -169,12 +162,21 @@ class TestMockSitlIntegration(unittest.TestCase):
         status = self.transport.connect(timeout_s=3.0)
         self.assertEqual(status.state, ConnectionState.CONNECTED)
         self.assertTrue(self.transport.arm(timeout_s=2.0))
-        time.sleep(0.3)
+        self.assertTrue(
+            self._wait_until(lambda: self.transport.read_drone_telemetry().pose is not None)
+        )
         self.assertIsNone(self.transport.landed_state)
 
         before = len(self.server.received_commands())
         self.transport.emergency_stop()
-        time.sleep(0.25)
+        self.assertTrue(
+            self._wait_until(
+                lambda: any(
+                    c[0] == MAV_CMD_NAV_LAND
+                    for c in self.server.received_commands()[before:]
+                )
+            )
+        )
         new = self.server.received_commands()[before:]
         hold_at = next(i for i, c in enumerate(new) if c[0] == MAV_CMD_DO_SET_MODE)
         land_at = next(i for i, c in enumerate(new) if c[0] == MAV_CMD_NAV_LAND)
@@ -204,6 +206,20 @@ class TestMockSitlIntegration(unittest.TestCase):
         self.assertEqual(flagged_status.state, ConnectionState.ERROR)
         self.assertIsNone(flagged._sock)
         self.assertIsNone(self.server.client_address)
+
+    def test_takeoff_denied_while_disarmed(self) -> None:
+        self.transport.connect(timeout_s=3.0)
+        self.assertFalse(self.transport.takeoff(altitude_m=2.0, timeout_s=2.0))
+        self.assertFalse(self.server.armed)
+        self.assertLess(self.server.altitude, 0.05)
+
+    def test_disarm_denied_while_airborne(self) -> None:
+        self.transport.connect(timeout_s=3.0)
+        self.assertTrue(self.transport.arm(timeout_s=2.0))
+        self.transport.takeoff(altitude_m=2.0)
+        self.assertTrue(self._wait_until(lambda: self.server.altitude > 0.5))
+        self.assertFalse(self.transport.disarm(timeout_s=2.0))
+        self.assertTrue(self.server.armed)
 
     def _wait_until(self, predicate, timeout: float = 3.0) -> bool:
         deadline = time.time() + timeout

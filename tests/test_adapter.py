@@ -14,7 +14,10 @@ from ohho_drone.mavlink.messages import (
     MAV_LANDED_STATE_IN_AIR,
     MAV_LANDED_STATE_ON_GROUND,
     PX4_MODE_AUTO_LOITER,
+    AttitudeMessage,
     CommandLongMessage,
+    LocalPositionNedMessage,
+    SysStatusMessage,
 )
 from ohho_drone.schema import (
     ConnectionState,
@@ -248,6 +251,10 @@ class TestAdapter(unittest.TestCase):
         self.assertTrue(simulation_target_allowed("localhost", sitl=False))
         self.assertFalse(simulation_target_allowed("192.168.1.20", sitl=True))
         self.assertFalse(simulation_target_allowed("host.docker.internal", sitl=False))
+        self.assertTrue(simulation_target_allowed("gateway.docker.internal", sitl=True))
+        self.assertTrue(simulation_target_allowed("host.containers.internal", sitl=True))
+        self.assertFalse(simulation_target_allowed("evil.docker.internal", sitl=True))
+        self.assertFalse(simulation_target_allowed("foo.containers.internal", sitl=True))
 
     def _capture(self, transport: MavlinkDroneTransport) -> list[object]:
         sent: list[object] = []
@@ -257,6 +264,29 @@ class TestAdapter(unittest.TestCase):
 
         transport._send_message = collect  # type: ignore[method-assign]
         return sent
+
+    def test_local_position_uses_yaw_rate_not_yaw_angle(self) -> None:
+        """A later position update must keep ATTITUDE.yawspeed as omega."""
+        transport = MavlinkDroneTransport()
+        transport._process_incoming(AttitudeMessage(yaw=1.2, yawspeed=0.4))
+        transport._process_incoming(
+            LocalPositionNedMessage(x=1.0, y=2.0, z=-3.0, vx=0.1, vy=0.2, vz=-0.3)
+        )
+        assert transport._telemetry.odom is not None
+        self.assertAlmostEqual(transport._telemetry.odom.theta, 1.2)
+        self.assertAlmostEqual(transport._telemetry.odom.omega, 0.4)
+        self.assertAlmostEqual(transport._telemetry.velocity.yaw_rate, 0.4)
+
+    def test_unknown_battery_remaining_stays_none(self) -> None:
+        transport = MavlinkDroneTransport()
+        transport._process_incoming(
+            SysStatusMessage(battery_remaining=-1, voltage_battery=11000)
+        )
+        self.assertIsNone(transport._telemetry.battery)
+        transport._process_incoming(
+            SysStatusMessage(battery_remaining=50, voltage_battery=11000)
+        )
+        self.assertAlmostEqual(transport._telemetry.battery, 0.5)
 
     def test_clamp_helper(self) -> None:
         self.assertEqual(clamp(1.5, 0.0, 1.0), 1.0)

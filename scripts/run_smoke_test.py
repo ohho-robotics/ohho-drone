@@ -28,6 +28,12 @@ from ohho_drone.schema import ConnectionState, DroneVelocity, FlightMode  # noqa
 from ohho_drone.sitl.mock_server import MockPx4SitlServer  # noqa: E402
 
 
+def _require(condition: object, message: str) -> None:
+    """Raise on failure. Unlike assert, this stays active under python -O."""
+    if not condition:
+        raise RuntimeError(message)
+
+
 def run_smoke_test() -> int:
     print("--- Starting OhhO Drone PX4 SITL MAVLink Smoke Test ---")
 
@@ -55,9 +61,10 @@ def run_smoke_test() -> int:
         # 2. Connect
         print("[2] Connecting to mock server...")
         status = transport.connect(timeout_s=3.0)
-        assert (
-            status.state == ConnectionState.CONNECTED
-        ), f"Expected CONNECTED, got {status.state}"
+        _require(
+            status.state == ConnectionState.CONNECTED,
+            f"Expected CONNECTED, got {status.state}",
+        )
         print(f"    Connected successfully: {status.label}")
 
         # 3. Wait for telemetry streaming
@@ -66,15 +73,19 @@ def run_smoke_test() -> int:
         while len(received_frames) < 5 and (time.time() - start_wait) < 3.0:
             time.sleep(0.05)
 
-        assert (
-            len(received_frames) >= 5
-        ), f"Expected >= 5 telemetry frames, got {len(received_frames)}"
+        _require(
+            len(received_frames) >= 5,
+            f"Expected >= 5 telemetry frames, got {len(received_frames)}",
+        )
         print(f"    Received {len(received_frames)} telemetry frames.")
 
         snap = transport.read_drone_telemetry()
-        assert snap.global_pos is not None, "Missing global GNSS position"
-        assert snap.pose is not None, "Missing 6-DOF pose"
-        assert snap.battery is not None and snap.battery > 0.0, "Missing battery status"
+        _require(snap.global_pos is not None, "Missing global GNSS position")
+        _require(snap.pose is not None, "Missing 6-DOF pose")
+        _require(
+            snap.battery is not None and snap.battery > 0.0,
+            "Missing battery status",
+        )
         print(
             f"    Telemetry verified: battery={snap.battery*100:.0f}%, "
             f"lat={snap.global_pos.lat:.4f}"
@@ -83,9 +94,8 @@ def run_smoke_test() -> int:
         # 4. Arming
         print("[4] Testing arm command...")
         armed = transport.arm(timeout_s=2.0)
-        assert armed, "Arm command failed or timed out"
-        time.sleep(0.1)
-        assert server.armed, "Server does not report armed state"
+        _require(armed, "Arm command failed or timed out")
+        _require(server.armed, "Server does not report armed state")
         print("    Arm command verified.")
 
         # 5. Takeoff command. Climb well clear of the ground so the later
@@ -95,7 +105,10 @@ def run_smoke_test() -> int:
         climb_deadline = time.time() + 3.0
         while server.altitude < 1.0 and time.time() < climb_deadline:
             time.sleep(0.05)
-        assert server.altitude > 1.0, f"Expected climb, got altitude {server.altitude}"
+        _require(
+            server.altitude > 1.0,
+            f"Expected climb, got altitude {server.altitude}",
+        )
         print(f"    Takeoff verified (altitude: {server.altitude:.2f}m).")
 
         # 6. Velocity setpoint
@@ -103,35 +116,49 @@ def run_smoke_test() -> int:
         transport.send_drone_velocity(
             DroneVelocity(linear_x=1.0, linear_y=0.0, linear_z=0.0)
         )
-        time.sleep(0.3)
-        assert server.x > 0.05, f"Expected forward motion, got x={server.x}"
+        motion_deadline = time.time() + 3.0
+        while server.x <= 0.05 and time.time() < motion_deadline:
+            time.sleep(0.05)
+        _require(server.x > 0.05, f"Expected forward motion, got x={server.x}")
         print(f"    Velocity control verified (x position: {server.x:.2f}m).")
 
         # 7. In-flight emergency stop must land/hold, not disarm.
         print("[7] Testing in-flight emergency stop...")
         transport.emergency_stop()
-        time.sleep(0.2)
-        assert server.armed, "In-flight emergency stop must not disarm"
-        assert server.flight_mode in (
-            FlightMode.LAND,
-            FlightMode.HOLD,
-        ), f"Expected LAND or HOLD, got {server.flight_mode}"
-        assert not any(
-            c[0] == MAV_CMD_COMPONENT_ARM_DISARM and int(c[1]) == 0
-            for c in server.received_commands()
-        ), "In-flight emergency stop sent a disarm"
-        assert not any(
-            int(c[2]) == MAV_FORCE_DISARM_MAGIC for c in server.received_commands()
-        ), "Force-disarm magic was sent"
+        mode_deadline = time.time() + 3.0
+        while (
+            server.flight_mode not in (FlightMode.LAND, FlightMode.HOLD)
+            and time.time() < mode_deadline
+        ):
+            time.sleep(0.05)
+        _require(server.armed, "In-flight emergency stop must not disarm")
+        _require(
+            server.flight_mode in (FlightMode.LAND, FlightMode.HOLD),
+            f"Expected LAND or HOLD, got {server.flight_mode}",
+        )
+        _require(
+            not any(
+                c[0] == MAV_CMD_COMPONENT_ARM_DISARM and int(c[1]) == 0
+                for c in server.received_commands()
+            ),
+            "In-flight emergency stop sent a disarm",
+        )
+        _require(
+            not any(
+                int(c[2]) == MAV_FORCE_DISARM_MAGIC for c in server.received_commands()
+            ),
+            "Force-disarm magic was sent",
+        )
         transport.release_stop()
         print("    In-flight emergency stop verified (land/hold, still armed).")
 
         # 8. Clean disconnect
         print("[8] Testing disconnect...")
         transport.disconnect()
-        assert (
-            transport.status().state == ConnectionState.DISCONNECTED
-        ), "Failed to disconnect"
+        _require(
+            transport.status().state == ConnectionState.DISCONNECTED,
+            "Failed to disconnect",
+        )
         print("    Disconnect verified.")
 
         print("--- ALL SMOKE TESTS PASSED SUCCESSFULLY ---")
@@ -146,6 +173,7 @@ def run_smoke_test() -> int:
 
     finally:
         unsub()
+        transport.disconnect()
         server.stop()
 
 

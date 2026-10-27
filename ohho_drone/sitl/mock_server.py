@@ -45,14 +45,22 @@ from ..mavlink.messages import (
 )
 from ..schema import FlightMode
 
+# Altitude above ground, in metres, above which a normal disarm is rejected.
+# Force-disarm (param2=21196) stays denied at every altitude.
+_IN_AIR_ALTITUDE_M = 0.25
+
 
 class MockPx4SitlServer:
-    """Simulated PX4 autopilot node communicating via MAVLink over UDP."""
+    """Simulated PX4 autopilot node communicating via MAVLink over UDP.
+
+    Binds the autopilot local port. Stock PX4 SITL listens on UDP 14580.
+    Clients send to that port and this server replies to the sender.
+    """
 
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 14540,
+        port: int = 14580,
         sysid: int = 1,
         compid: int = 1,
         initial_lat: float = 47.397742,  # Zurich default PX4 home
@@ -197,6 +205,10 @@ class MockPx4SitlServer:
                         self._send_command_ack(
                             MAV_CMD_COMPONENT_ARM_DISARM, MAV_RESULT_DENIED, addr
                         )
+                    elif int(msg.param1) != 1 and -self.z > _IN_AIR_ALTITUDE_M:
+                        self._send_command_ack(
+                            MAV_CMD_COMPONENT_ARM_DISARM, MAV_RESULT_DENIED, addr
+                        )
                     else:
                         should_arm = bool(int(msg.param1) == 1)
                         self.armed = should_arm
@@ -220,7 +232,7 @@ class MockPx4SitlServer:
                         )
                     else:
                         self._send_command_ack(
-                            MAV_CMD_NAV_TAKEOFF, MAV_RESULT_ACCEPTED, addr
+                            MAV_CMD_NAV_TAKEOFF, MAV_RESULT_DENIED, addr
                         )
 
                 elif msg.command == MAV_CMD_NAV_LAND:

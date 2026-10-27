@@ -9,6 +9,13 @@ import struct
 from dataclasses import dataclass
 from typing import ClassVar
 
+
+def _pad(data: bytes, size: int) -> bytes:
+    """Zero-fill a MAVLink v2 payload that omitted trailing zero bytes."""
+    if len(data) >= size:
+        return data
+    return data + bytes(size - len(data))
+
 # Standard MAVLink Commands
 MAV_CMD_NAV_LAND = 21
 MAV_CMD_NAV_TAKEOFF = 22
@@ -97,6 +104,7 @@ class HeartbeatMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> HeartbeatMessage:
+        data = _pad(data, 9)
         (custom_mode, type_, autopilot, base_mode, system_status, mavlink_version) = (
             struct.unpack("<IBBBBB", data[:9])
         )
@@ -139,6 +147,7 @@ class AttitudeMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> AttitudeMessage:
+        data = _pad(data, 28)
         fields = struct.unpack("<Iffffff", data[:28])
         return cls(*fields)
 
@@ -172,6 +181,7 @@ class LocalPositionNedMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> LocalPositionNedMessage:
+        data = _pad(data, 28)
         fields = struct.unpack("<Iffffff", data[:28])
         return cls(*fields)
 
@@ -225,6 +235,7 @@ class GlobalPositionIntMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> GlobalPositionIntMessage:
+        data = _pad(data, 28)
         fields = struct.unpack("<IiiiihhhH", data[:28])
         return cls(*fields)
 
@@ -242,7 +253,7 @@ class SysStatusMessage:
     load: int = 0
     voltage_battery: int = 12600  # mV (3S LiPo ~ 12.6V)
     current_battery: int = 500  # cA (5.0A)
-    battery_remaining: int = 95  # % (0..100)
+    battery_remaining: int = 95  # % (0..100); -1 means unknown
     drop_rate_comm: int = 0
     errors_comm: int = 0
     errors_count1: int = 0
@@ -259,27 +270,57 @@ class SysStatusMessage:
         return self.current_battery / 100.0
 
     def pack(self) -> bytes:
+        # MAVLink v2 orders fields by size. int8 battery_remaining is last.
         return struct.pack(
-            "<IIIHHhBHHHHHH",
+            "<IIIHHhHHHHHHb",
             self.onboard_control_sensors_present,
             self.onboard_control_sensors_enabled,
             self.onboard_control_sensors_health,
             self.load,
             self.voltage_battery,
             self.current_battery,
-            self.battery_remaining,
             self.drop_rate_comm,
             self.errors_comm,
             self.errors_count1,
             self.errors_count2,
             self.errors_count3,
             self.errors_count4,
+            self.battery_remaining,
         )
 
     @classmethod
     def unpack(cls, data: bytes) -> SysStatusMessage:
-        fields = struct.unpack("<IIIHHhBHHHHHH", data[:31])
-        return cls(*fields)
+        data = _pad(data, 31)
+        (
+            present,
+            enabled,
+            health,
+            load,
+            voltage,
+            current,
+            drop,
+            errs,
+            e1,
+            e2,
+            e3,
+            e4,
+            remaining,
+        ) = struct.unpack("<IIIHHhHHHHHHb", data[:31])
+        return cls(
+            onboard_control_sensors_present=present,
+            onboard_control_sensors_enabled=enabled,
+            onboard_control_sensors_health=health,
+            load=load,
+            voltage_battery=voltage,
+            current_battery=current,
+            battery_remaining=remaining,
+            drop_rate_comm=drop,
+            errors_comm=errs,
+            errors_count1=e1,
+            errors_count2=e2,
+            errors_count3=e3,
+            errors_count4=e4,
+        )
 
 
 @dataclass
@@ -319,6 +360,7 @@ class CommandLongMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> CommandLongMessage:
+        data = _pad(data, 33)
         fields = struct.unpack("<fffffffHBBB", data[:33])
         return cls(*fields)
 
@@ -338,6 +380,7 @@ class CommandAckMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> CommandAckMessage:
+        data = _pad(data, 3)
         (command, result) = struct.unpack("<HB", data[:3])
         return cls(command=command, result=result)
 
@@ -357,6 +400,7 @@ class ExtendedSysStateMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> ExtendedSysStateMessage:
+        data = _pad(data, 2)
         vtol_state, landed_state = struct.unpack("<BB", data[:2])
         return cls(vtol_state=vtol_state, landed_state=landed_state)
 
@@ -414,6 +458,7 @@ class SetPositionTargetLocalNedMessage:
 
     @classmethod
     def unpack(cls, data: bytes) -> SetPositionTargetLocalNedMessage:
+        data = _pad(data, 53)
         fields = struct.unpack("<IfffffffffffHBBB", data[:53])
         return cls(*fields)
 

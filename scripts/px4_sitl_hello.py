@@ -10,8 +10,8 @@ Usage:
   # Run in mock SITL mode (zero-dependency, suitable for CI and headless testing):
   python scripts/px4_sitl_hello.py --mock
 
-  # Run against a live local PX4 SITL Docker container or local binary on port 14540:
-  python scripts/px4_sitl_hello.py --host 127.0.0.1 --port 14540
+  # Send to a live local PX4 SITL offboard port (PX4 listens on UDP 14580):
+  python scripts/px4_sitl_hello.py --host 127.0.0.1 --port 14580 --takeoff
 """
 
 from __future__ import annotations
@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--port",
         type=int,
-        default=14540,
-        help="SITL MAVLink UDP target port (default: 14540)",
+        default=14580,
+        help="PX4 SITL local UDP port to send to (default: 14580)",
     )
     parser.add_argument(
         "--mock",
@@ -59,9 +59,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--takeoff",
-        action="store_true",
-        default=True,
-        help="Run takeoff, velocity setpoint, and land flight sequence (default: True)",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run the takeoff, velocity setpoint and land sequence (default: off)",
     )
     return parser.parse_args()
 
@@ -110,6 +110,8 @@ def main() -> int:
 
     unsub = transport.on_telemetry(on_telemetry)
 
+    sequence_started = False
+    sequence_finished = False
     try:
         print(
             f"[2/5] Connecting to MAVLink endpoint (timeout: {args.timeout:.1f}s)..."
@@ -156,15 +158,24 @@ def main() -> int:
             )
 
         if args.takeoff:
+            sequence_started = True
             print("\n[4/5] Executing simulated flight sequence:")
             print("      -> Sending ARM command...")
-            if transport.arm():
-                print("      [+] Autopilot armed.")
-            else:
-                print("      [!] Arming command sent (proceeding).")
+            if not transport.arm():
+                print(
+                    "      [-] Arming was not acknowledged. Aborting.",
+                    file=sys.stderr,
+                )
+                return 1
+            print("      [+] Autopilot armed.")
 
             print("      -> Sending TAKEOFF command (target: 2.5m)...")
-            transport.takeoff(altitude_m=2.5)
+            if not transport.takeoff(altitude_m=2.5):
+                print(
+                    "      [-] Takeoff was not acknowledged. Aborting.",
+                    file=sys.stderr,
+                )
+                return 1
             time.sleep(1.0)
 
             print(
@@ -176,8 +187,14 @@ def main() -> int:
             time.sleep(1.0)
 
             print("      -> Sending LAND command...")
-            transport.land()
+            if not transport.land():
+                print(
+                    "      [-] Land was not acknowledged. Aborting.",
+                    file=sys.stderr,
+                )
+                return 1
             time.sleep(0.5)
+            sequence_finished = True
 
         print("\n[5/5] Disconnecting...")
         transport.disconnect()
@@ -187,6 +204,9 @@ def main() -> int:
         return 0
 
     finally:
+        if sequence_started and not sequence_finished:
+            transport.emergency_stop()
+        transport.disconnect()
         unsub()
         if mock_server is not None:
             mock_server.stop()

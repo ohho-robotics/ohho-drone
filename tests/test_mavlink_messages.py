@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 import unittest
 
 from ohho_drone.mavlink.codec import MavlinkCodec
@@ -16,12 +17,14 @@ from ohho_drone.mavlink.messages import (
     AttitudeMessage,
     CommandAckMessage,
     CommandLongMessage,
+    ExtendedSysStateMessage,
     GlobalPositionIntMessage,
     HeartbeatMessage,
     LocalPositionNedMessage,
     SetPositionTargetLocalNedMessage,
     SysStatusMessage,
 )
+from ohho_drone.mavlink.packet import MavlinkPacket
 
 
 class TestMavlinkMessages(unittest.TestCase):
@@ -124,6 +127,36 @@ class TestMavlinkMessages(unittest.TestCase):
         self.assertEqual(unpacked.current_battery, 450)
         self.assertEqual(unpacked.battery_remaining, 92)
 
+    def test_sys_status_wire_order_puts_signed_battery_last(self) -> None:
+        """battery_remaining is the final int8, after errors_count4."""
+        status = SysStatusMessage(
+            onboard_control_sensors_present=1,
+            onboard_control_sensors_enabled=2,
+            onboard_control_sensors_health=3,
+            load=4,
+            voltage_battery=12600,
+            current_battery=450,
+            battery_remaining=-1,
+            drop_rate_comm=5,
+            errors_comm=6,
+            errors_count1=7,
+            errors_count2=8,
+            errors_count3=9,
+            errors_count4=10,
+        )
+        packed = status.pack()
+        fields = struct.unpack("<IIIHHhHHHHHHb", packed)
+        self.assertEqual(fields[6], 5)
+        self.assertEqual(fields[11], 10)
+        self.assertEqual(fields[12], -1)
+        unpacked = SysStatusMessage.unpack(packed)
+        self.assertEqual(unpacked.drop_rate_comm, 5)
+        self.assertEqual(unpacked.errors_count4, 10)
+        self.assertEqual(unpacked.battery_remaining, -1)
+        truncated = SysStatusMessage.unpack(packed[:-1])
+        self.assertEqual(truncated.battery_remaining, 0)
+        self.assertEqual(truncated.errors_count4, 10)
+
     def test_command_long_and_ack(self) -> None:
         cmd = CommandLongMessage(
             command=MAV_CMD_NAV_TAKEOFF,
@@ -183,6 +216,32 @@ class TestMavlinkMessages(unittest.TestCase):
         self.assertIsInstance(decoded, HeartbeatMessage)
         assert isinstance(decoded, HeartbeatMessage)
         self.assertTrue(decoded.is_armed)
+
+    def test_truncated_v2_payload_still_decodes(self) -> None:
+        """Trailing zero bytes omitted by a v2 sender still unpack."""
+        short = MavlinkPacket(
+            msgid=ExtendedSysStateMessage.msg_id,
+            payload=b"\x00",
+        )
+        raw = short.pack(crc_extra=ExtendedSysStateMessage.crc_extra)
+        results = MavlinkCodec().feed(raw)
+        self.assertEqual(len(results), 1)
+        decoded = results[0][1]
+        self.assertIsInstance(decoded, ExtendedSysStateMessage)
+        assert isinstance(decoded, ExtendedSysStateMessage)
+        self.assertEqual(decoded.vtol_state, 0)
+        self.assertEqual(decoded.landed_state, 0)
+
+        position = LocalPositionNedMessage(
+            time_boot_ms=10, x=1.5, y=-2.0, z=0.0, vx=0.0, vy=0.0, vz=0.0
+        )
+        full = position.pack()
+        trimmed = full[:12]
+        unpacked = LocalPositionNedMessage.unpack(trimmed)
+        self.assertAlmostEqual(unpacked.x, 1.5, places=5)
+        self.assertAlmostEqual(unpacked.y, -2.0, places=5)
+        self.assertEqual(unpacked.z, 0.0)
+        self.assertEqual(unpacked.vz, 0.0)
 
 
 if __name__ == "__main__":

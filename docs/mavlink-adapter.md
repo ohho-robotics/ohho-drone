@@ -111,15 +111,19 @@ from ohho_drone.adapter import MavlinkDroneTransport
 from ohho_drone.schema import DroneVelocity
 
 # Create adapter targeting SITL endpoint
-transport = MavlinkDroneTransport(host="127.0.0.1", port=14540)
+# Send to PX4 SITL's offboard local port (14580), not the 14540 remote port.
+transport = MavlinkDroneTransport(host="127.0.0.1", port=14580)
 
 # Connect and wait for heartbeat
 status = transport.connect(timeout_s=3.0)
 print(f"Status: {status.state.value}")
 
-# Subscribe to continuous telemetry stream
+# Subscribe to continuous telemetry stream.
+# pose_6dof.z is NED Down, so altitude above the origin is -z.
 def on_telemetry(tele):
-    print(f"Altitude: {tele.custom.get('drone', {}).get('pose_6dof', {}).get('z')}m")
+    z = tele.custom.get("drone", {}).get("pose_6dof", {}).get("z")
+    altitude = None if z is None else -z
+    print(f"Altitude: {altitude}m")
 
 unsub = transport.on_telemetry(on_telemetry)
 

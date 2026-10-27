@@ -21,17 +21,20 @@ In standard PX4 SITL, communication ports are allocated as follows:
 ```text
 ┌──────────────────────────────────────────────┐
 │                  PX4 SITL                    │
-│   (Docker container or local native binary)  │
+│   listens on UDP :14580 (offboard local)     │
 └──────┬────────────────────────────────┬──────┘
-       │ UDP :14540                     │ UDP :14550
-       ▼                                ▼
+       │ UDP :14580                     │ UDP :14550
+       ▲  client sends, PX4 replies     ▼
 ┌──────────────────────────┐     ┌──────────────────────────┐
 │ OhhO Drone Transport     │     │ QGroundControl (GCS)     │
-│ (MavlinkDroneTransport)  │     │ (Optional GUI monitor)   │
+│ sends to UDP :14580      │     │ (Optional GUI monitor)   │
 └──────────────────────────┘     └──────────────────────────┘
 ```
 
-- **`14540/udp`**: Default offboard API port. The OhhO Drone MAVLink transport connects here to exchange heartbeats, telemetry, and velocity setpoints.
+PX4 SITL v1.14 (`px4-rc.mavlink`) binds the offboard MAVLink link on UDP **14580** and sends an unsolicited stream to UDP **14540**. This transport sends to 14580 and reads replies on its own ephemeral port. It does not bind 14540. A datagram sent to 14540 is not received by PX4.
+
+- **`14580/udp`**: PX4's offboard local port. `MavlinkDroneTransport` sends heartbeats, commands, and setpoints here.
+- **`14540/udp`**: PX4's offboard remote port. PX4 sends heartbeats to this port. This transport does not listen on it.
 - **`14550/udp`**: Default Ground Control Station (GCS) port. You can concurrently run QGroundControl to visually observe the simulated drone's artificial horizon, flight mode, and map location.
 
 ---
@@ -92,7 +95,7 @@ Once PX4 SITL is running (or in headless CI environments using the built-in mock
 If Docker or PX4 is not installed, the script includes an in-process pure-Python mock SITL server that simulates heartbeat generation, attitude/odometry streaming, battery health, and arming/takeoff/landing lifecycles:
 
 ```bash
-python scripts/px4_sitl_hello.py --mock
+python scripts/px4_sitl_hello.py --mock --takeoff
 ```
 
 Sample output:
@@ -128,10 +131,10 @@ Sample output:
 
 ### B. Live PX4 SITL Mode
 
-When running against a live PX4 container or local build listening on port 14540:
+When PX4 SITL is running, send to its offboard local port (14580). Pass `--takeoff` only when the arm, climb, velocity, and land sequence should run:
 
 ```bash
-python scripts/px4_sitl_hello.py --host 127.0.0.1 --port 14540
+python scripts/px4_sitl_hello.py --host 127.0.0.1 --port 14580 --takeoff
 ```
 
 ---
@@ -144,4 +147,4 @@ For continuous integration and automated test suites, run:
 python scripts/run_smoke_test.py
 ```
 
-This executes an end-to-end handshake, validates telemetry parsing (odometry, 6-DOF pose, GNSS, battery), exercises simulated arming, takeoff climb, velocity setpoints, and emergency stop disarm in under 2 seconds.
+This executes an end-to-end handshake, validates telemetry parsing (odometry, 6-DOF pose, GNSS, battery), and exercises simulated arming, takeoff climb, and velocity setpoints. The in-flight emergency stop keeps the vehicle armed and commands LAND or HOLD. The script checks that no disarm is sent.

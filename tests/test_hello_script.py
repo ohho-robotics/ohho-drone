@@ -15,7 +15,7 @@ class TestHelloScript(unittest.TestCase):
             Path(__file__).resolve().parent.parent / "scripts" / "px4_sitl_hello.py"
         )
         res = subprocess.run(
-            [sys.executable, str(script_path), "--mock", "--timeout", "3.0"],
+            [sys.executable, str(script_path), "--mock", "--takeoff", "--timeout", "3.0"],
             capture_output=True,
             text=True,
             timeout=10,

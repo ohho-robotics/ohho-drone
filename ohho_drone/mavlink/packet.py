@@ -145,6 +145,8 @@ class MavlinkPacket:
             return pkt, total_len
 
         elif magic == MAVLINK_V1_STX:
+            if len(buffer) < HEADER_LEN_V1:
+                return None, 0
             payload_len = buffer[1]
             total_len = HEADER_LEN_V1 + payload_len + CHECKSUM_LEN
             if len(buffer) < total_len:

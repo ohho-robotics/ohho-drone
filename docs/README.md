@@ -2,7 +2,7 @@
 
 > **WARNING: EXPERIMENTAL STRETCH PROTOTYPE — NOT FLIGHT-READY — SIMULATION ONLY**  
 > Nothing in this repository has been tested on real aircraft hardware.  
-> No hardware commands are run from any automated session.  
+> The workflows in `.github/workflows/` do not run hardware commands (`python.yml`, `credibility.yml`, `sitl-ardupilot.yml`). This tree does not show what other automation might run.  
 > Do not use this software for physical flight or real flight controllers.
 
 ---

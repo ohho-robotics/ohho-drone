@@ -79,6 +79,12 @@ class TestMavlinkPacket(unittest.TestCase):
         self.assertEqual(parsed.payload, payload)
         self.assertFalse(parsed.is_v2)
 
+    def test_v1_one_byte_buffer_does_not_raise(self) -> None:
+        """A lone v1 magic byte is an incomplete packet, not an IndexError."""
+        parsed, consumed = MavlinkPacket.parse_one(b"\xfe")
+        self.assertIsNone(parsed)
+        self.assertEqual(consumed, 0)
+
     def test_parse_incomplete_buffer(self) -> None:
         """Incomplete buffer should return None and 0 consumed."""
         pkt = MavlinkPacket(

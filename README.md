@@ -4,9 +4,9 @@
 
 **Concept — not started.** The working robot is [OmniBot](https://github.com/ohho-robotics/OmniBot).
 
-This repository is a placeholder for a drone form factor in the [OhhO Robotics](https://github.com/ohho-robotics) org. It does not contain a robot description, flight controller, simulator, or model.
+This repository is a placeholder for a drone form factor in the [OhhO Robotics](https://github.com/ohho-robotics) org. It does not contain a robot description or a hardware flight controller. An experimental software-simulation hello-world is documented in [docs/README.md](docs/README.md). Nothing here has flown.
 
-Research and plan; no flight code yet: [docs/research/drone-stacks.md](docs/research/drone-stacks.md), [docs/plan/implementation-plan.md](docs/plan/implementation-plan.md).
+Research and plan: [docs/research/drone-stacks.md](docs/research/drone-stacks.md), [docs/plan/implementation-plan.md](docs/plan/implementation-plan.md).
 
 ## Clone
 
@@ -31,7 +31,7 @@ Emergency stop does not kill motors in the air. An airborne vehicle is commanded
 Not in this repository:
 
 - A checked-in airframe description and a simulator launch that runs from public packages
-- A flight-controller hello-world
+- A flight-controller hello-world that has been run on a real vehicle
 - Hardware bring-up for a specific airframe
 
 ## Documentation
