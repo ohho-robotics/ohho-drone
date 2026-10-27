@@ -85,14 +85,13 @@ Read at `C:\Users\varun\ohho\ohho-drone-ohh-67`. Not merged. The README on that 
 - E-stop policy in `ohho_drone/adapter.py` `emergency_stop` and `docs/mavlink-adapter.md` section 5. In the air it sends `MAV_CMD_NAV_LAND`. If landed state is unknown it sends hold (`MAV_CMD_DO_SET_MODE` to PX4 `AUTO.LOITER`) and then land. It disarms with `MAV_CMD_COMPONENT_ARM_DISARM` param1=0 param2=0 only when `EXTENDED_SYS_STATE` says on the ground and altitude agrees. It never sends force-disarm magic `21196`. The software latch blocks later velocity until `release_stop()`. This is the right Ohho-level e-stop. It is not a motor kill.
 - `simulation_target_allowed`: `connect()` refuses anything that is not loopback, plus a short docker-local name list when `sitl=True`. A hardware backend must not weaken this by accident. Hardware belongs behind `SafetyGate`, on an explicit URI, with the arming phrase.
 - `ohho_drone/sitl/mock_server.py` and the tests (`tests/test_adapter.py`, `tests/test_mock_sitl.py`, `tests/test_mavlink_*.py`, `tests/test_hello_script.py`). They are a contract for "arm, take off, velocity, land, e-stop does not force-disarm". They are not a dynamics model.
-- The port map in `docs/px4-sitl.md`: UDP 14540 offboard API, UDP 14550 ground station. That split is still what PX4 documents for the prebuilt containers (section 8).
+- The port map in `docs/px4-sitl.md`: the transport sends to PX4 SITL's local UDP port 14580. PX4 sends its offboard stream to UDP 14540. QGroundControl uses UDP 14550.
 
 ### Replace
 
 - `ohho_drone/mavlink/codec.py`, `packet.py`, and `messages.py`. The codec understands nine messages (heartbeat, sys status, attitude, local position, global position, command long, command ack, position target, extended sys state). A real PX4 stream also carries GPS status, battery status, estimator flags, statustext, ping, and parameter traffic. CRC extras are hand-copied. This will drift from the XML dialect. **pymavlink 2.4.50** generates codecs from the XML (`https://pypi.org/project/pymavlink/`, 19 Oct 2026). **MAVSDK 4** sits above that and already implements arm, takeoff, land, RTL, offboard velocity, and telemetry.
 - The SITL instructions that pull `px4io/px4-sitl:v1.14.0` and `HEADLESS=1 make px4_sitl none_iris`. v1.14 is two stables behind v1.17.0. Current containers are in section 8.
 - A few mappings that should not be copied forward:
-  - `LocalPositionNedMessage` handling sets `Odometry.omega` from `pose.yaw` (an angle), not from a yaw rate.
   - `DronePose.z` keeps NED down, while altitude for the e-stop is `-z` and `GlobalCoordinates.relative_alt`. Callers can mix them.
   - `send_drone_velocity` labels the frame `MAV_FRAME_BODY_NED` but copies `linear_x` straight into `vx` with no yaw rotation. That is body-forward only if the autopilot treats the frame as body FRD. The comment diagram in `docs/mavlink-adapter.md` also calls `linear_x` "North / Body X", which conflates two frames.
   - Heartbeat parsing sets `FlightMode.STABILIZED` for any armed heartbeat. It does not decode PX4 custom mode.
