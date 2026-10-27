@@ -2,7 +2,8 @@
 
 OHH-306. The workflow starts ``sim_vehicle.py -v ArduCopter`` headless at the
 pinned Copter-4.7.2 tag, then this script waits until ArduPilot's own pre-arm
-bit, EKF flags, and a 3D GPS fix say the copter is armable. It emits the newest ``LOCAL_POSITION_NED`` sample into the aerial
+bit, EKF flags, and a 3D GPS fix say the copter is armable. It emits the newest
+``LOCAL_POSITION_NED`` sample into the aerial
 ``SafetyGate`` and arms that gate only after the emit, then streams an
 offboard setpoint, arms the autopilot, climbs to
 2.5 m, flies a 4 m square, and lands. ``--print-recipe`` only prints those steps.
@@ -26,8 +27,9 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Protocol
 
 COPTER_TAG = "Copter-4.7.2"
 COPTER_COMMIT = "fb773567896014da007bca58358704d4a0d8516f"
