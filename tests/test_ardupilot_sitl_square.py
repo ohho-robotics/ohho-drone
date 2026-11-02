@@ -11,9 +11,10 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ardupilot_sitl_square.py"
@@ -695,7 +696,7 @@ class _DirectMessage:
         self.fields_json = json.dumps(fields)
 
     @classmethod
-    def from_mapping(cls, message_name: str, fields: dict[str, int]) -> "_DirectMessage":
+    def from_mapping(cls, message_name: str, fields: dict[str, int]) -> _DirectMessage:
         payload: dict[str, object] = {key: value for key, value in fields.items()}
         return cls(message_name, payload)
 
